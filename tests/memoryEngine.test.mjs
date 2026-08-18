@@ -5,7 +5,9 @@ import {
     buildSameDayLedger,
     buildStoryCalendar,
     buildStoryClock,
+    collectActiveSummaryCoverage,
     isCalendarSummaryEvent,
+    isOriginalEventCoveredByActiveSummary,
     parseMemoryProtocolLine,
     replayAgendaLifecycle,
     replayItemLifecycle,
@@ -873,7 +875,7 @@ test('日历识别总结与跨段回顾标记，普通事件不受影响', () =>
     assert.equal(isCalendarSummaryEvent({ level: '关键', summary: '真实发生的事件' }), false);
 });
 
-test('日历排除总结和活跃压缩覆盖的原事件，但不改动事件时间线来源数据', () => {
+test('日历排除总结卡但保留被总结覆盖的原始关键事件，且不改动来源数据', () => {
     const chat = [message({ date: '2026/2/4', time: '09:00' })];
     chat[0].horae_meta.events = [
         { level: '关键', summary: '林夏取得港口仓库的钥匙。', _compressedBy: 'S-ACTIVE' },
@@ -890,7 +892,8 @@ test('日历排除总结和活跃压缩覆盖的原事件，但不改动事件�
 
     const calendar = buildStoryCalendar(chat);
 
-    assert.equal(calendar.days[0].events.length, 0);
+    assert.equal(calendar.days[0].events.length, 1);
+    assert.match(calendar.days[0].events[0].summary, /仓库的钥匙/);
     assert.equal(chat[0].horae_meta.events.length, 3);
     assert.equal(chat[0].horae_meta.events.some(event => event.isSummary), true);
     assert.deepEqual(chat, original);
@@ -938,7 +941,7 @@ test('总结停用后，日历恢复此前被压缩的原事件', () => {
     assert.match(calendar.days[0].events[0].summary, /昨夜有人闯入/);
 });
 
-test('日历优先展示关键事件且最多六条，其余事件仍可展开', () => {
+test('日历优先展示三条关键事件，其余事件仍可展开', () => {
     const levels = ['一般', '重要', '关键', '重要', '关键', '重要', '关键', '重要', '一般'];
     const chat = levels.map((level, index) => {
         const entry = message({
@@ -951,10 +954,117 @@ test('日历优先展示关键事件且最多六条，其余事件仍可展开',
 
     const day = buildStoryCalendar(chat).days[0];
     assert.equal(day.events.length, 9);
-    assert.equal(day.featuredEvents.length, 6);
-    assert.equal(day.otherEvents.length, 3);
-    assert.deepEqual(day.featuredEvents.map(event => event.priorityRank), [3, 3, 3, 2, 2, 2]);
+    assert.equal(day.featuredEvents.length, 3);
+    assert.equal(day.otherEvents.length, 6);
+    assert.deepEqual(day.featuredEvents.map(event => event.priorityRank), [3, 3, 3]);
     assert.equal(day.otherEvents.some(event => event.priority === 'normal'), true);
+});
+
+test('旧总结缺少 active 和事件压缩标记时，显示层仍按覆盖范围隐藏原事件', () => {
+    const chat = [message({ date: '2026/2/4', time: '09:00' })];
+    chat[0].horae_meta.events = [
+        { level: '重要', summary: '林夏确认了仓库钥匙的来源。' },
+        { level: '摘要', summary: '林夏完成仓库调查。', isSummary: true, _summaryId: 'S-LEGACY' },
+    ];
+    chat[0].horae_meta.autoSummaries = [{
+        id: 'S-LEGACY',
+        coveredIndices: [0],
+        summaryText: '林夏完成仓库调查。',
+    }];
+
+    const coverage = collectActiveSummaryCoverage(chat);
+
+    assert.equal(coverage.ids.has('S-LEGACY'), true);
+    assert.equal(isOriginalEventCoveredByActiveSummary(chat[0].horae_meta.events[0], 0, coverage), true);
+    assert.equal(isOriginalEventCoveredByActiveSummary(chat[0].horae_meta.events[1], 0, coverage), false);
+    assert.equal(buildStoryCalendar(chat).days[0].events.length, 1);
+    assert.match(buildStoryCalendar(chat).days[0].events[0].summary, /钥匙的来源/);
+});
+
+test('日历用 autoSummaries 正文识别没有摘要标记的旧总结卡', () => {
+    const chat = [message({ date: '2026/2/4', time: '09:00' })];
+    chat[0].horae_meta.events = [
+        { level: '重要', summary: '林夏在仓库找到一册旧账本。' },
+        { level: 'major', summary: '林夏完成仓库调查并取得关键线索。' },
+    ];
+    chat[0].horae_meta.autoSummaries = [{
+        id: 'S-UNMARKED',
+        active: true,
+        coveredIndices: [0],
+        summaryText: '林夏完成仓库调查并取得关键线索。',
+    }];
+
+    const day = buildStoryCalendar(chat).days[0];
+
+    assert.deepEqual(day.events.map(event => event.summary), ['林夏在仓库找到一册旧账本。']);
+});
+
+test('多天事件即使都被总结覆盖，日历仍逐日保留原事件并排除旧总结卡', () => {
+    const chat = [
+        message({ date: '2026/2/4', time: '09:00' }),
+        message({ date: '2026/2/5', time: '10:00' }),
+        message({ date: '2026/2/6', time: '11:00' }),
+    ];
+    const originals = [
+        '林夏在港口取得仓库钥匙。',
+        '林夏在账房找到货运记录。',
+        '林夏确认艾伦曾进入仓库。',
+    ];
+    const summaries = [
+        '林夏完成港口调查并取得仓库线索。',
+        '林夏完成账房调查并锁定货运记录。',
+        '林夏完成证人调查并确认艾伦的行踪。',
+    ];
+
+    for (let index = 0; index < chat.length; index++) {
+        chat[index].horae_meta.events = [
+            { level: '关键', summary: originals[index] },
+            { level: 'major', summary: `剧情总结：${summaries[index]}` },
+        ];
+    }
+    chat[0].horae_meta.autoSummaries = summaries.map((summaryText, index) => ({
+        id: `S-DAY-${index}`,
+        active: true,
+        coveredIndices: [index],
+        summaryText,
+    }));
+
+    const calendar = buildStoryCalendar(chat);
+
+    assert.equal(calendar.days.length, 3);
+    assert.deepEqual(calendar.days.map(day => day.events.map(event => event.summary)), originals.map(text => [text]));
+});
+
+test('旧版已移走楼层事件时，日历从总结 originalEvents 恢复逐日关键事件', () => {
+    const chat = [
+        message({ date: '2026/2/4', time: '09:00' }),
+        message({ date: '2026/2/5', time: '10:00' }),
+        message({ date: '2026/2/6', time: '11:00' }),
+    ];
+    const originals = [
+        '林夏在港口取得仓库钥匙。',
+        '林夏在账房找到货运记录。',
+        '林夏确认艾伦曾进入仓库。',
+    ];
+    chat[0].horae_meta.autoSummaries = [{
+        id: 'S-REMOVED-EVENTS',
+        active: true,
+        coveredIndices: [0, 1, 2],
+        summaryText: '林夏完成了连续三天的仓库调查。',
+        originalEvents: originals.map((summary, index) => ({
+            msgIdx: index,
+            evtIdx: 0,
+            event: { level: '关键', summary },
+            timestamp: { story_date: `2026/2/${index + 4}`, story_time: `${index + 9}:00` },
+        })),
+    }];
+    const originalChat = structuredClone(chat);
+
+    const calendar = buildStoryCalendar(chat);
+
+    assert.equal(calendar.days.length, 3);
+    assert.deepEqual(calendar.days.map(day => day.events.map(event => event.summary)), originals.map(text => [text]));
+    assert.deepEqual(chat, originalChat);
 });
 
 test('日历只合并同日真正重复的事件，不吞掉不同事件', () => {

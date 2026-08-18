@@ -948,12 +948,16 @@ function describeItemChange(record, messageIndex, ordinal, fallbackAction = 'upd
 }
 
 /** Calendar-only summary detection. Timeline data remains untouched. */
-export function isCalendarSummaryEvent(event) {
+export function isCalendarSummaryEvent(event, knownSummaryTexts = null) {
     if (!event || typeof event !== 'object') return false;
     if (event.isSummary || event._summaryId || event._carryoverSeed) return true;
     const level = cleanText(event.level).toLowerCase().replace(/\s+/g, '');
-    return /^(?:摘要|总结|總結|summary|要約|요약|конспект)(?:l?\d+)?/iu.test(level)
-        || /^(?:回顾|回顧|recap|振り返り|회고|обзор)$/iu.test(level);
+    if (/^(?:摘要|总结|總結|summary|要約|요약|конспект)(?:l?\d+)?/iu.test(level)
+        || /^(?:回顾|回顧|recap|振り返り|회고|обзор)$/iu.test(level)) return true;
+    const normalizedSummary = normalizeCalendarSummaryReference(event.summary);
+    if (!normalizedSummary || !knownSummaryTexts?.size) return false;
+    if (knownSummaryTexts.has(normalizedSummary)) return true;
+    return [...knownSummaryTexts].some(known => areSimilarCalendarEvents(normalizedSummary, known));
 }
 
 function calendarEventPriority(event) {
@@ -968,6 +972,13 @@ function normalizeCalendarEventText(value) {
         .normalize('NFKC')
         .toLowerCase()
         .replace(/[\p{P}\p{S}\s]+/gu, '');
+}
+
+function normalizeCalendarSummaryReference(value) {
+    return normalizeCalendarEventText(value).replace(
+        /^(?:(?:剧情|劇情|故事|事件|本段|本次|阶段|階段|章节|章節|今日|当日|當日|story|event|chapter)?(?:摘要|总结|總結|summary|要約|요약|конспект|回顾|回顧|recap)(?:l?\d+)?(?:内容|內容)?)/iu,
+        '',
+    );
 }
 
 function areSimilarCalendarEvents(left, right) {
@@ -995,7 +1006,7 @@ function addCalendarEvent(day, candidate) {
     if (candidateWins) day.events[duplicateIndex] = candidate;
 }
 
-function finalizeCalendarEvents(day, previewLimit = 6) {
+function finalizeCalendarEvents(day, previewLimit = 3) {
     const chronological = [...day.events].sort((a, b) =>
         a.messageIndex - b.messageIndex || a.eventIndex - b.eventIndex
     );
@@ -1017,15 +1028,20 @@ function finalizeCalendarEvents(day, previewLimit = 6) {
     day.otherEvents = ranked.filter(event => !featuredIds.has(event.id));
 }
 
-function collectActiveSummaryCoverage(chat) {
+export function collectActiveSummaryCoverage(chat) {
     const ids = new Set();
     const messageIndices = new Set();
+    const summaryTexts = new Set();
     const summaries = chat?.[0]?.horae_meta?.autoSummaries;
-    if (!Array.isArray(summaries)) return { ids, messageIndices };
+    if (!Array.isArray(summaries)) return { ids, messageIndices, summaryTexts };
 
     for (const summary of summaries) {
         if (!summary || summary.active === false) continue;
         if (summary.id) ids.add(String(summary.id));
+        for (const text of [summary.summaryText, summary.summary, summary.title]) {
+            const normalized = normalizeCalendarSummaryReference(text);
+            if (normalized) summaryTexts.add(normalized);
+        }
         if (Array.isArray(summary.coveredIndices) && summary.coveredIndices.length > 0) {
             for (const index of summary.coveredIndices) {
                 if (Number.isInteger(index) && index >= 0) messageIndices.add(index);
@@ -1036,7 +1052,29 @@ function collectActiveSummaryCoverage(chat) {
             for (let index = start; index <= end; index++) messageIndices.add(index);
         }
     }
-    return { ids, messageIndices };
+    return { ids, messageIndices, summaryTexts };
+}
+
+function collectCalendarSummaryTexts(chat) {
+    const texts = new Set();
+    const summaries = chat?.[0]?.horae_meta?.autoSummaries;
+    if (!Array.isArray(summaries)) return texts;
+    for (const summary of summaries) {
+        if (!summary || typeof summary !== 'object') continue;
+        for (const text of [summary.summaryText, summary.summary, summary.title]) {
+            const normalized = normalizeCalendarSummaryReference(text);
+            if (normalized) texts.add(normalized);
+        }
+    }
+    return texts;
+}
+
+/** Runtime-only check used by calendar and timeline views for legacy summaries. */
+export function isOriginalEventCoveredByActiveSummary(event, messageIndex, coverage) {
+    if (!event || isCalendarSummaryEvent(event, coverage?.summaryTexts)) return false;
+    const compressedBy = cleanText(event._compressedBy);
+    return !!(compressedBy && coverage?.ids?.has(compressedBy))
+        || coverage?.messageIndices?.has(messageIndex) === true;
 }
 
 /**
@@ -1051,7 +1089,8 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
     const days = new Map();
     const seenLegacyAgenda = new Set();
     const seenLegacyItems = new Set();
-    const activeSummaryCoverage = collectActiveSummaryCoverage(chat);
+    const calendarSummaryTexts = collectCalendarSummaryTexts(chat);
+    const frameByMessageIndex = new Map(frames.map(frame => [frame.messageIndex, frame]));
     const relationshipState = new Map();
     let previousLocation = '';
 
@@ -1142,10 +1181,7 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
         for (let j = 0; j < events.length; j++) {
             const event = events[j];
             const summary = cleanText(event?.summary);
-            const compressedByActive = event?._compressedBy
-                && activeSummaryCoverage.ids.has(String(event._compressedBy));
-            if (!summary || isCalendarSummaryEvent(event) || compressedByActive
-                || activeSummaryCoverage.messageIndices.has(frame.messageIndex)) continue;
+            if (!summary || isCalendarSummaryEvent(event, calendarSummaryTexts)) continue;
             const priorityRank = calendarEventPriority(event);
             addCalendarEvent(day, {
                 id: stableMemoryId('E', frame.messageIndex, j, summary),
@@ -1228,6 +1264,59 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
         }
         for (let j = 0; j < (meta.deletedItems || []).length; j++) {
             day.itemChanges.push(describeItemChange({ name: meta.deletedItems[j], action: 'close', status: 'consumed' }, frame.messageIndex, j, 'close'));
+        }
+    }
+
+    // Older Horae builds could remove source events after compression. Project
+    // the preserved originals back into the calendar without mutating chat data.
+    const summaries = chat?.[0]?.horae_meta?.autoSummaries;
+    if (Array.isArray(summaries)) {
+        for (const summaryEntry of summaries) {
+            if (!summaryEntry || summaryEntry.active === false || !Array.isArray(summaryEntry.originalEvents)) continue;
+            for (let originalIndex = 0; originalIndex < summaryEntry.originalEvents.length; originalIndex++) {
+                const original = summaryEntry.originalEvents[originalIndex];
+                const messageIndex = Number(original?.msgIdx ?? original?.messageIndex);
+                if (!Number.isInteger(messageIndex) || messageIndex < 0 || messageIndex >= limit) continue;
+
+                const sourceMeta = chat?.[messageIndex]?.horae_meta;
+                if (!sourceMeta || sourceMeta._skipHorae || isFlashbackMeta(sourceMeta)) continue;
+                const event = original?.event;
+                const eventSummary = cleanText(event?.summary);
+                if (!eventSummary || isCalendarSummaryEvent(event, calendarSummaryTexts)) continue;
+
+                const sourceFrame = frameByMessageIndex.get(messageIndex);
+                const timestamp = original?.timestamp && typeof original.timestamp === 'object'
+                    ? original.timestamp
+                    : (sourceMeta.timestamp || {});
+                const date = cleanText(sourceFrame?.date || timestamp.story_date || sourceMeta.timestamp?.story_date);
+                if (!date) continue;
+                const time = cleanText(sourceFrame?.time || timestamp.story_time || sourceMeta.timestamp?.story_time);
+                const restoredFrame = sourceFrame || {
+                    normalizedKey: normalizeStoryDateKey(date),
+                    date,
+                    time,
+                    parsed: parseStoryDate(date),
+                };
+                if (!restoredFrame.normalizedKey) continue;
+
+                const day = ensureDay(restoredFrame);
+                if (!day.messageIndices.includes(messageIndex)) day.messageIndices.push(messageIndex);
+                if (time && !day.firstTime) day.firstTime = time;
+                if (time) day.lastTime = time;
+                const eventIndex = Number.isInteger(original?.evtIdx) ? original.evtIdx : originalIndex;
+                const priorityRank = calendarEventPriority(event);
+                addCalendarEvent(day, {
+                    id: stableMemoryId('E', messageIndex, eventIndex, eventSummary),
+                    messageIndex,
+                    eventIndex,
+                    date,
+                    time,
+                    level: cleanText(event.level) || '一般',
+                    summary: eventSummary,
+                    priorityRank,
+                    priority: priorityRank >= 3 ? 'critical' : (priorityRank === 2 ? 'important' : 'normal'),
+                });
+            }
         }
     }
 

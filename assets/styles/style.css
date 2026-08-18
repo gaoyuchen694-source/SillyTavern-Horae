@@ -1122,7 +1122,7 @@ button.horae-calendar-record:hover {
 .horae-calendar-action.relationships { color: #ec4899; }
 
 .horae-calendar-other-events[hidden] {
-    display: none;
+    display: none !important;
 }
 
 .horae-calendar-disclosure {

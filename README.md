@@ -1,4 +1,4 @@
-# Horae v1.17.1 - Memory Engine for SillyTavern
+# Horae v1.17.2 - Memory Engine for SillyTavern
 
 **English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
@@ -100,7 +100,7 @@ window.Horae?.getEvents(10)      // → last 10 events
 window.Horae?.getSettings()
 
 // Version string
-window.Horae?.version            // → "1.17.1"
+window.Horae?.version            // → "1.17.2"
 ```
 
 Settings change events are broadcast via SillyTavern's `eventSource`:
@@ -132,12 +132,14 @@ eventSource.on('horae:settingsChanged', (data) => {
 
 ---
 
-## What's New in v1.17.1
+## What's New in v1.17.2
 
 ### Story Calendar Refinements
 
-- The calendar now excludes summaries and carryover recaps while the event timeline continues to display summary cards.
-- Each day initially shows up to six key or important events, with remaining events available through an accessible disclosure control.
+- The calendar excludes summary cards and carryover recaps while retaining their underlying key events; the event timeline continues to display summary cards.
+- Each day initially shows three representative key events, with remaining events available through an accessible disclosure control.
+- Legacy source events removed from message metadata are projected read-only from `originalEvents` onto their original story dates.
+- Legacy summaries without compression markers now hide their covered originals in the event view while preserving the summary card.
 - Similar same-day events are deduplicated, and location and relationship changes now appear alongside plans, items, and time anomalies.
 - Calendar filtering is runtime-only and does not alter chat metadata, AI summary injection, same-day memory, or vector recall.
 

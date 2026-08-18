@@ -3,7 +3,7 @@
  * 基于时间锚点的AI记忆增强系统
  * 
  * 作者: SenriYuki
- * 版本: 1.17.1
+ * 版本: 1.17.2
  */
 
 import { renderExtensionTemplateAsync, getContext, extension_settings } from '/scripts/extensions.js';
@@ -11,6 +11,7 @@ import { getSlideToggleOptions, saveSettingsDebounced, eventSource, event_types,
 import { slideToggle } from '/lib.js';
 
 import { composeHoraeInjectionPrompt, horaeManager, createEmptyMeta, getItemBaseName } from './core/horaeManager.js';
+import { collectActiveSummaryCoverage, isCalendarSummaryEvent, isOriginalEventCoveredByActiveSummary } from './core/memoryEngine.js';
 import {
     getAddedAiScanRecordIndices,
     markAiScannedMeta,
@@ -28,7 +29,7 @@ import { initPromptDefaults, ensurePromptDefaults, ensurePresetPrompts, getPromp
 const EXTENSION_NAME = 'horae';
 const EXTENSION_FOLDER = `third-party/SillyTavern-Horae`;
 const TEMPLATE_PATH = `${EXTENSION_FOLDER}/assets/templates`;
-const VERSION = '1.17.1';
+const VERSION = '1.17.2';
 
 // settings 来源标记。仅用于区分「上次写入是否本版本自身」，外部来源（旧版本/其他分发版）会触发一次确认弹窗
 const ENGINE_TAG = 'horae-official';
@@ -2712,10 +2713,15 @@ function updateTimelineDisplay() {
     // 获取摘要映射（summaryId → entry），用于判定压缩状态
     const chat = horaeManager.getChat();
     const summaries = chat?.[0]?.horae_meta?.autoSummaries || [];
-    const activeSummaryIds = new Set(summaries.filter(s => s.active).map(s => s.id));
+    const activeSummaryCoverage = collectActiveSummaryCoverage(chat);
+    const activeSummaryIds = activeSummaryCoverage.ids;
     const renderSummaryLevelBadge = (summaryEntry) => {
         const depth = _normalizeSummaryDepth(summaryEntry?.depth);
         return `<span class="horae-level-badge summary">${t('timeline.summaryBadge')} L${depth}</span>`;
+    };
+    const renderSummaryRange = (summaryEntry) => {
+        const range = _getSummaryEntryRange(summaryEntry);
+        return range ? `#${range[0]}-#${range[1]}` : '';
     };
 
     // 旧对话回顾（_carryoverSeed）的折叠 banner：折叠时单条隐藏，展开时正常列出
@@ -2743,7 +2749,7 @@ function updateTimelineDisplay() {
     }
 
     listEl.innerHTML = events.reverse().map(e => {
-        const isSummary = e.event?.isSummary || e.event?.level === '摘要';
+        const isSummary = isCalendarSummaryEvent(e.event, activeSummaryCoverage.summaryTexts);
         const compressedBy = e.event?._compressedBy;
         const summaryId = e.event?._summaryId;
         const isCarryoverSeed = !!e.event?._carryoverSeed;
@@ -2754,13 +2760,13 @@ function updateTimelineDisplay() {
         }
 
         // 已被压缩的事件：当对应摘要处于 active 状态时隐藏
-        if (compressedBy && activeSummaryIds.has(compressedBy)) {
+        if (isOriginalEventCoveredByActiveSummary(e.event, e.messageIndex, activeSummaryCoverage)) {
             return '';
         }
         // 摘要事件：inactive 时渲染为折叠指示条（保留切换按钮）
         if (summaryId && !activeSummaryIds.has(summaryId)) {
             const summaryEntry = summaries.find(s => s.id === summaryId);
-            const rangeStr = summaryEntry ? `#${summaryEntry.range[0]}-#${summaryEntry.range[1]}` : '';
+            const rangeStr = renderSummaryRange(summaryEntry);
             const summaryBadge = renderSummaryLevelBadge(summaryEntry);
             return `
             <div class="horae-timeline-item summary horae-summary-collapsed" data-message-id="${e.messageIndex}" data-summary-id="${summaryId}">
@@ -2828,8 +2834,8 @@ function updateTimelineDisplay() {
             const summaryContent = e.event?.summary || '';
             const summaryDisplay = summaryContent || `<span class="horae-summary-hint">${t('tooltip.editSummary')}</span>`;
             const summaryEntry = summaryId ? summaries.find(s => s.id === summaryId) : null;
-            const isActive = summaryEntry?.active;
-            const rangeStr = summaryEntry ? `#${summaryEntry.range[0]}-#${summaryEntry.range[1]}` : '';
+            const isActive = summaryEntry ? summaryEntry.active !== false : false;
+            const rangeStr = renderSummaryRange(summaryEntry);
             const summaryBadge = renderSummaryLevelBadge(summaryEntry);
             // 有 summaryId 的摘要事件带切换/删除/编辑按钮
             const toggleBtns = summaryId ? `
@@ -3260,7 +3266,7 @@ async function toggleSummaryActive(summaryId) {
     if (!sums) return;
     const entry = sums.find(s => s.id === summaryId);
     if (!entry) return;
-    entry.active = !entry.active;
+    entry.active = entry.active === false;
     // 同步消息可见性：active=摘要模式→隐藏原消息，inactive=原始模式→显示原消息
     const indices = getSummaryMsgIndices(entry);
     await setMessagesHidden(chat, indices, entry.active);
@@ -10347,7 +10353,7 @@ function _restoreCompressedFlags(meta, saved) {
     if (nonSummaryFlags.length > 0 && meta.events.length > 0) {
         const chat = horaeManager.getChat();
         const sums = chat?.[0]?.horae_meta?.autoSummaries || [];
-        const activeSumIds = new Set(sums.filter(s => s.active).map(s => s.id));
+        const activeSumIds = new Set(sums.filter(s => s.active !== false).map(s => s.id));
         for (const evt of meta.events) {
             if (evt.isSummary || evt._summaryId || evt._compressedBy) continue;
             const matchFlag = nonSummaryFlags.find(f => f._compressedBy && activeSumIds.has(f._compressedBy));
@@ -10384,7 +10390,7 @@ function cleanOrphanSummaries() {
 
     let restored = 0;
     for (const s of sums) {
-        if (!s.active || !s.range || !s.id) continue;
+        if (s.active === false || !s.range || !s.id) continue;
         const summaryId = s.id;
 
         let cardFound = false;
@@ -10456,7 +10462,7 @@ async function enforceHiddenState() {
 
     let fixed = 0;
     for (const s of sums) {
-        if (!s.active) continue;
+        if (s.active === false) continue;
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
             if (i === 0 || !chat[i]) continue;
@@ -10497,7 +10503,7 @@ function repairAllSummaryStates() {
 
     let fixed = 0;
     for (const s of sums) {
-        if (!s.active) continue;
+        if (s.active === false) continue;
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
             if (i === 0 || !chat[i]) continue;
