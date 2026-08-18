@@ -1,8 +1,8 @@
-# Horae - 時光記憶 v1.15.1 | SillyTavern 記憶增強插件
+# Horae - 時光記憶 v1.17.0 | SillyTavern 記憶增強插件
 
 [English](README.md) | [简体中文](README.zh-CN.md) | **繁體中文**
 
-![Image](https://github.com/SenriYuki/SillyTavern-Horae/blob/main/HoraeLogo.jpg)
+![Image](https://github.com/gaoyuchen694-source/SillyTavern-Horae/blob/main/HoraeLogo.jpg)
 
 > *Horae（荷賴）— 希臘神話中掌管時序的女神*
 
@@ -13,6 +13,12 @@
 ---
 
 ## 亮點功能
+
+**同日權威記憶 —— 下午仍記得上午發生的事**
+當天所有有效事件會進入獨立的同日記憶帳本，不受普通時間線深度、摘要隱藏或向量門檻影響。主線故事時鐘會隔離閃回，並對沒有劇情依據的時間倒退顯示異常提示。
+
+**敘事日曆與生命週期 —— 時間過去，世界也會變化**
+日曆按劇情日期彙整事件、計畫、物品變化與時間異常，支援公曆、自訂曆法和無法換算為月份的奇幻日期。計畫會完成、取消、逾期或歸檔；`dueAt` 只表示計畫/截止時間，跨到第二天不會清除安排在幾天後的計畫，逾期後也會繼續保留為 `overdue`。物品支援數量變化、轉移、消耗、到期和按日遞減，不再無限堆積。
 
 **RPG 模式 —— 血條、技能、聲望、裝備、等級、貨幣一目了然**
 為西幻 / 修真 / 戰鬥向角色卡量身打造的全模組化 RPG 系統。各子系統（屬性條、多維屬性、技能、聲望、裝備、等級、貨幣）均為**獨立可選開關**，按需組合。關閉時不注入提示詞、不消耗 Token。
@@ -36,22 +42,32 @@
 ## 快速安裝
 
 1. 開啟 SillyTavern → 頂部擴充面板（積木圖示）→ 「安裝擴充」
-2. 貼上本倉庫的 Git 連結，點擊安裝
+2. 貼上 `https://github.com/gaoyuchen694-source/SillyTavern-Horae.git`，點擊安裝
 3. 安裝完成後重新整理頁面即可使用
 
 > 配套正則會在插件首次載入時**自動注入**，無需手動匯入。
 
 ---
 
-## v1.14.0 更新內容
+## 從原版 Horae 升級
 
-### 輔助 API
+原版 Horae 聊天資料可以直接使用。以本倉庫取代原版擴充、重新整理 SillyTavern 後，再開啟原來的聊天即可。新版記憶引擎會自動重放現有 `horae_meta`、`item`、`item-`、`agenda` 與 `agenda-` 資料，**無需匯出、遷移按鈕或重新掃描全部歷史**。
 
-- **獨立設定區塊**：新增「輔助 API」，不依賴自動總結開關，單獨填寫 API 地址、密鑰與模型。
-- **三組用途開關**：可分別用於 AI 分析/魔術棒/發送前補全、自動總結/AI 智慧補全、手動多選壓縮。
-- **串行隊列**：輔助 API 請求會排隊執行，降低多個後台任務同時觸發 429 的概率。
-- **預設不回退主 API**：輔助 API 失敗時預設不偷跑主 API，避免繼續撞主 API 速率限制。
-- **安全匯出**：API 地址、密鑰、模型不會進入 Horae 配置檔匯出內容。
+取代擴充前建議備份重要聊天。增強版保留原擴充目錄與資料格式以實現直接相容，請勿同時重複安裝原版倉庫與增強版倉庫。
+
+---
+
+## v1.17.0 更新內容
+
+### 記憶、時間與生命週期
+
+- **同日權威記憶**：當天完整事件固定參與上下文建構，重點解決下午忘記上午劇情的問題。
+- **長期召回增強**：向量文件加入計畫、物品、NPC 身分與關係事實，隱藏和未隱藏歷史都可參與長期召回。
+- **主線故事時鐘**：閃回不會推進主線；無依據的時間倒退會被攔截並記錄。
+- **敘事日曆**：按日期瀏覽事件、計畫期限、物品變化與時間異常，兼容公曆、自訂曆法與奇幻日期。
+- **計畫與物品生命週期**：支援完成、取消、逾期、歸檔、數量變化、轉移、消耗、到期與每日遞減；未來計畫跨日仍保持待執行，`dueAt` 不會觸發自動完成或刪除。
+- **穩定編輯與刪除**：計畫和物品使用穩定 ID 與覆蓋層保存修改，刪除後不會因重新掃描歷史而復活。
+- **原資料直接兼容**：原 Horae 的 `item`、`item-`、`agenda`、`agenda-` 資料無需遷移，可直接重放為新狀態。
 
 > 更早版本的更新日志请查看 [CHANGELOG.md](CHANGELOG.md)
 
@@ -77,7 +93,7 @@
 | Русский | ✅ 完整 |
 
 
-希望 Horae 支援你的語言？歡迎提交 [Issue](https://github.com/SenriYuki/SillyTavern-Horae/issues) 或直接 PR 翻譯檔案！
+希望 Horae 支援你的語言？歡迎提交 [Issue](https://github.com/gaoyuchen694-source/SillyTavern-Horae/issues) 或直接 PR 翻譯檔案！
 
 ---
 
@@ -99,7 +115,7 @@ window.Horae?.getEvents(10)      // → 最近 10 筆事件
 window.Horae?.getSettings()
 
 // 版本號
-window.Horae?.version            // → "1.14.0"
+window.Horae?.version            // → "1.17.0"
 ```
 
 設定變更事件透過酒館的 `eventSource` 廣播：
@@ -122,6 +138,8 @@ eventSource.on('horae:settingsChanged', (data) => {
 
 **作者：SenriYuki**
 
+**增強版維護：[@gaoyuchen694-source](https://github.com/gaoyuchen694-source)**
+
 ### 翻譯致謝
 
 - **俄語 (Русский)** — [@KiskaSora](https://github.com/KiskaSora)
@@ -129,4 +147,3 @@ eventSource.on('horae:settingsChanged', (data) => {
 ### 致謝
 
 - [@baibai-git](https://github.com/baibai-git) — PR #5 整合貢獻
-

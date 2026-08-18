@@ -6,6 +6,23 @@
 import { parseStoryDate, calculateRelativeTime, calculateDetailedRelativeTime, generateTimeReference, formatRelativeTime, formatFullDateTime, getRelativeTimeMeta, setCustomCalendar } from '../utils/timeUtils.js';
 import { detectEffectiveAiLangIsZh, detectEffectiveAiLang } from './i18n.js';
 import { getPromptDefaultSync } from './promptDefaults.js';
+import {
+    buildSameDayLedger,
+    buildStoryCalendar,
+    buildStoryClock,
+    isFlashbackMeta,
+    parseMemoryProtocolLine,
+    projectActiveItems,
+    replayAgendaLifecycle,
+    replayItemLifecycle,
+} from './memoryEngine.js';
+
+/** Compose the exact Horae system-message body inserted into the AI prompt. */
+export function composeHoraeInjectionPrompt(dataPrompt, recallPrompt, rulesPrompt, antiParaRef = '') {
+    return recallPrompt
+        ? `${dataPrompt}\n${recallPrompt}\n${rulesPrompt}${antiParaRef}`
+        : `${dataPrompt}\n${rulesPrompt}${antiParaRef}`;
+}
 
 /**
  * @typedef {Object} HoraeTimestamp
@@ -49,6 +66,7 @@ import { getPromptDefaultSync } from './promptDefaults.js';
 /** 创建空的元数据对象 */
 export function createEmptyMeta() {
     return {
+        schemaVersion: 2,
         timestamp: {
             story_date: '',
             story_time: '',
@@ -69,6 +87,9 @@ export function createEmptyMeta() {
         agenda: [],
         mood: {},
         relationships: [],
+        storyClock: null,
+        itemLifecycle: [],
+        agendaLifecycle: [],
     };
 }
 
@@ -104,6 +125,38 @@ function findExistingItemByBaseName(stateItems, newName) {
         }
     }
     return null;
+}
+
+/** Filter equipped inventory entries by stable ID, with counted name fallback for legacy equipment. */
+export function filterUnequippedItemEntries(itemEntries, equipment = {}) {
+    const equippedIds = new Set();
+    const legacyNameCounts = new Map();
+    const normalizeId = value => String(value ?? '').trim().replace(/^#/, '');
+
+    for (const slots of Object.values(equipment || {})) {
+        for (const equippedItems of Object.values(slots || {})) {
+            for (const equipped of (Array.isArray(equippedItems) ? equippedItems : [])) {
+                const stableId = normalizeId(equipped?._itemMeta?.id || equipped?._itemMeta?._id || equipped?.id || equipped?._id);
+                if (stableId) {
+                    equippedIds.add(stableId);
+                    continue;
+                }
+                const name = String(equipped?.name ?? '').trim();
+                if (name) legacyNameCounts.set(name, (legacyNameCounts.get(name) || 0) + 1);
+            }
+        }
+    }
+
+    return (itemEntries || []).filter(([projectionName, info]) => {
+        const stableId = normalizeId(info?.id || info?._id);
+        if (stableId && equippedIds.has(stableId)) return false;
+
+        const candidateNames = [...new Set([info?.name, projectionName].map(value => String(value ?? '').trim()).filter(Boolean))];
+        const legacyName = candidateNames.find(name => (legacyNameCounts.get(name) || 0) > 0);
+        if (!legacyName) return true;
+        legacyNameCounts.set(legacyName, legacyNameCounts.get(legacyName) - 1);
+        return false;
+    });
 }
 
 /** Horae 管理器 */
@@ -197,6 +250,8 @@ class HoraeManager {
             const meta = chat[i].horae_meta;
             if (!meta) continue;
             if (meta._skipHorae) continue;
+            // 闪回/回忆保留在事件历史和向量索引中，但不能覆盖主线当前状态。
+            if (isFlashbackMeta(meta)) continue;
             
             if (meta.timestamp?.story_date) {
                 state.timestamp.story_date = meta.timestamp.story_date;
@@ -286,7 +341,7 @@ class HoraeManager {
                         }
                         state.items[name] = mergedItem;
                     } else {
-                        state.items[name] = newInfo;
+                        state.items[name] = { ...newInfo };
                     }
                 }
             }
@@ -422,8 +477,41 @@ class HoraeManager {
                 info._id = padItemId(maxNpcId);
             }
         }
+
+        // v2 派生状态：旧物品和新生命周期事件统一按楼层重放。
+        // 结果仍投影回 name -> info，保持面板和第三方调用兼容。
+        const storyClock = buildStoryClock(chat, end);
+        const itemState = replayItemLifecycle(chat, end, { clock: storyClock });
+        state.storyClock = storyClock;
+        if (storyClock.lastMessageIndex >= 0) {
+            state.timestamp.story_date = storyClock.rawDate;
+            state.timestamp.story_time = storyClock.rawTime;
+        }
+        state.items = projectActiveItems(itemState);
+        state._itemMemory = itemState;
+        state._agendaMemory = replayAgendaLifecycle(chat, end, { clock: storyClock });
         
         return state;
+    }
+
+    /** 获取可随编辑/删除/swipe 重建的增强记忆状态。 */
+    getMemoryState(skipLast = 0) {
+        const chat = this.getChat();
+        const end = Math.max(0, chat.length - skipLast);
+        const clock = buildStoryClock(chat, end);
+        const agenda = replayAgendaLifecycle(chat, end, { clock });
+        const items = replayItemLifecycle(chat, end, { clock });
+        return {
+            clock,
+            sameDay: buildSameDayLedger(chat, end, clock.rawDate),
+            agenda,
+            items,
+            calendar: buildStoryCalendar(chat, end, { clock, agenda, items }),
+        };
+    }
+
+    getAgendaState(skipLast = 0) {
+        return this.getMemoryState(skipLast).agenda;
     }
 
     /** 解析生日字符串，支持 yyyy-mm-dd / yyyy/mm/dd / mm-dd / mm/dd */
@@ -510,8 +598,9 @@ class HoraeManager {
     /** 通过ID查找物品 */
     findItemById(items, id) {
         const normalizedId = id.replace(/^#/, '').trim();
+        const numericId = parseInt(normalizedId, 10);
         for (const [name, info] of Object.entries(items)) {
-            if (info._id === normalizedId || info._id === padItemId(parseInt(normalizedId, 10))) {
+            if (String(info._id) === normalizedId || (Number.isFinite(numericId) && info._id === padItemId(numericId))) {
                 return [name, info];
             }
         }
@@ -544,13 +633,11 @@ class HoraeManager {
                     timestamp: meta.timestamp,
                     event: evt
                 });
-                
-                if (limit > 0 && events.length >= limit) break;
             }
-            if (limit > 0 && events.length >= limit) break;
         }
-        
-        return events;
+
+        // 限量调用应获得最近的事件，同时保持由旧到新的叙事顺序。
+        return limit > 0 ? events.slice(-limit) : events;
     }
 
     /** 获取重要事件列表（兼容旧调用） */
@@ -591,6 +678,13 @@ class HoraeManager {
     generateCompactPrompt(skipLast = 0) {
         const state = this.getLatestState(skipLast);
         const lines = [];
+        const memoryChat = this.getChat();
+        const memoryEnd = Math.max(0, memoryChat.length - skipLast);
+        const sameDayLedger = buildSameDayLedger(memoryChat, memoryEnd, state.storyClock?.rawDate || state.timestamp.story_date);
+        const sendSameDayMemory = this.settings?.sendSameDayMemory !== false;
+        const sameDayEventKeys = sendSameDayMemory
+            ? new Set(sameDayLedger.map(entry => `${entry.messageIndex}:${entry.eventIndex}`))
+            : new Set();
 
         const lang = this._getAiOutputLang();
         const L = (zh, en, ja, ko, ru) => {
@@ -615,6 +709,7 @@ class HoraeManager {
         const sendCharacterAffection = this.settings?.sendCharacterAffection !== false;
         const sendMainCharacterPersonality = this.settings?.sendMainCharacterPersonality !== false;
         const sendItems = this.settings?.sendItems !== false;
+        const sendAgenda = this.settings?.sendAgenda !== false;
 
         // 主要角色判定：卡片本体 + 置顶 NPC，含别名匹配以兼容 NPC 改名
         const mainCharName = this.context?.name2 || '';
@@ -655,6 +750,26 @@ class HoraeManager {
                 } else if (timeRef && timeRef.type === 'custom') {
                     lines.push(`[${L('时间参考','Time Ref','時間参考','시간 참조','Время (справка)')}|${L('自定义日历模式，相对时间见剧情轨迹','Custom calendar mode, see relative time in story timeline','カスタム暦モード、相対時間はストーリー軌跡参照','사용자 정의 달력 모드, 상대 시간은 스토리 궤적 참조','Пользовательский календарь, см. относительное время в сюжетной линии')}]`);
                 }
+            }
+        }
+
+        if (state.storyClock?.anomaly) {
+            const a = state.storyClock.anomaly;
+            lines.push(`[${L('时间异常','Time Anomaly','時間異常','시간 이상','Аномалия времени')}|${L(
+                `楼层#${a.messageIndex}尝试从“${a.previous}”倒退到“${a.proposed}”，因无闪回/回溯说明而未推进主线时钟`,
+                `Message #${a.messageIndex} tried to move backward from "${a.previous}" to "${a.proposed}"; the main clock was not changed because no flashback/rewind was declared`,
+                `#${a.messageIndex}で「${a.previous}」から「${a.proposed}」への逆行を検出。回想/巻き戻しの指定がないため主時間軸は維持`,
+                `#${a.messageIndex}에서 "${a.previous}"에서 "${a.proposed}"로의 역행을 감지했으며 회상/되감기 표시가 없어 메인 시계를 유지함`,
+                `В сообщении #${a.messageIndex} обнаружен переход назад с «${a.previous}» на «${a.proposed}»; основная шкала времени сохранена`,
+            )}]`);
+        }
+
+        // 同一天的所有有效事件都直接注入，不受 contextDepth 或向量相似度影响。
+        if (sendSameDayMemory && sameDayLedger.length > 0) {
+            lines.push(`\n[${L('当日记忆（权威）','Same-day Memory (authoritative)','当日の記憶（優先）','당일 기억(권위)','Память текущего дня (приоритет)')}]`);
+            for (const entry of sameDayLedger) {
+                const time = entry.time ? `${entry.time} ` : '';
+                lines.push(`#${entry.messageIndex} ${time}${entry.summary}`);
             }
         }
         
@@ -733,17 +848,12 @@ class HoraeManager {
         // 物品（已装备的物品不在此处显示，避免重复）
         if (sendItems) {
             const items = Object.entries(state.items);
-            // 收集已装备物品名集合
-            const equippedNames = new Set();
+            let equipment = {};
             if (this.settings?.rpgMode && !!this.settings.sendRpgEquipment) {
                 const rpgData = this.getRpgStateAt(skipLast);
-                for (const [, slots] of Object.entries(rpgData.equipment || {})) {
-                    for (const [, eqItems] of Object.entries(slots)) {
-                        for (const eq of eqItems) equippedNames.add(eq.name);
-                    }
-                }
+                equipment = rpgData.equipment || {};
             }
-            const unequipped = items.filter(([name]) => !equippedNames.has(name));
+            const unequipped = filterUnequippedItemEntries(items, equipment);
             if (unequipped.length > 0) {
                 lines.push(`\n[${L('物品清单','Item List','アイテムリスト','아이템 목록','Список предметов')}]`);
                 for (const [name, info] of unequipped) {
@@ -754,7 +864,11 @@ class HoraeManager {
                     const holder = info.holder || '';
                     const loc = info.location ? `@${info.location}` : '';
                     const impTag = imp ? `[${imp}]` : '';
-                    lines.push(`#${id} ${icon}${name}${impTag}${desc} = ${holder}${loc}`);
+                    const quantity = info.quantity?.value;
+                    const unit = info.quantity?.unit || '';
+                    const itemName = info.name || name;
+                    const displayName = quantity === null || quantity === undefined ? itemName : `${itemName}(${quantity}${unit})`;
+                    lines.push(`#${id} ${icon}${displayName}${impTag}${desc} = ${holder}${loc}`);
                 }
             } else {
                 lines.push(`\n[${L('物品清单','Item List','アイテムリスト','아이템 목록','Список предметов')}] (${L('空','empty','空','비어있음','пусто')})`);
@@ -806,41 +920,21 @@ class HoraeManager {
             }
         }
         
-        // 待办事项
-        const chatForAgenda = this.getChat();
-        const allAgendaItems = [];
-        const seenTexts = new Set();
-        const deletedTexts = new Set(chatForAgenda?.[0]?.horae_meta?._deletedAgendaTexts || []);
-        const userAgenda = chatForAgenda?.[0]?.horae_meta?.agenda || [];
-        for (const item of userAgenda) {
-            if (item._deleted || deletedTexts.has(item.text)) continue;
-            if (!seenTexts.has(item.text)) {
-                allAgendaItems.push(item);
-                seenTexts.add(item.text);
-            }
-        }
-        // AI写入的（swipe时跳过末尾消息）
-        const agendaEnd = Math.max(0, (chatForAgenda?.length || 0) - skipLast);
-        if (chatForAgenda) {
-            for (let i = 1; i < agendaEnd; i++) {
-                const msgAgenda = chatForAgenda[i].horae_meta?.agenda;
-                if (msgAgenda?.length > 0) {
-                    for (const item of msgAgenda) {
-                        if (item._deleted || deletedTexts.has(item.text)) continue;
-                        if (!seenTexts.has(item.text)) {
-                            allAgendaItems.push(item);
-                            seenTexts.add(item.text);
-                        }
-                    }
-                }
-            }
-        }
-        const activeAgenda = allAgendaItems.filter(a => !a.done);
-        if (activeAgenda.length > 0) {
+        // 待办由历史重放得到；完成项保留历史，但不再堆入活跃提示。
+        const activeAgenda = state._agendaMemory?.active || [];
+        if (sendAgenda && activeAgenda.length > 0) {
             lines.push(`\n[${L('待办事项','Agenda','予定事項','할 일 목록','Список дел')}]`);
+            lines.push(L(
+                '规则：dueAt是截止/计划时间，不是自动清除时间；跨到第二天也不得清除几天后的计划，未来日期未到时保持pending；逾期仍保留为overdue；仅在expiresAt/endAt已过或正文明确完成、取消、失效时关闭。',
+                'Rule: dueAt is a due/planned time, not an auto-removal time. Never clear a plan scheduled for later days merely because the story advances to the next day; keep it pending until due. Keep overdue entries active; close only after expiresAt/endAt or explicit completion, cancellation, or invalidation in the story.',
+                '規則：dueAtは期限・予定時刻であり自動削除時刻ではない。物語が翌日に進んでも数日後の予定を削除せず、期限まではpendingを維持する。期限超過後もoverdueとして保持し、expiresAt/endAt到達または本文で完了・取消・失効が明示された場合のみ閉じる。',
+                '규칙: dueAt은 마감/예정 시각이지 자동 삭제 시각이 아니다. 이야기가 다음 날로 넘어가도 며칠 뒤 계획을 삭제하지 말고 기한 전까지 pending으로 유지한다. 기한이 지난 계획은 overdue로 유지하며 expiresAt/endAt 경과 또는 본문의 명확한 완료·취소·무효 근거가 있을 때만 종료한다.',
+                'Правило: dueAt — срок/плановое время, а не время автоудаления. Переход сюжета на следующий день не удаляет планы на более поздние даты: до срока они остаются pending, после срока — активными overdue. Закрывать их можно лишь после expiresAt/endAt или явного завершения, отмены либо утраты актуальности в сюжете.',
+            ));
             for (const item of activeAgenda) {
-                const datePrefix = item.date ? `${item.date} ` : '';
-                lines.push(`· ${datePrefix}${item.text}`);
+                const due = item.dueAt ? `${L('截止','due','期限','기한','срок')}:${item.dueAt}` : '';
+                const status = ` [${item.status || 'pending'}]`;
+                lines.push(`#${item.id} ${item.text}${status}${due ? ` | ${due}` : ''}`);
             }
         }
         
@@ -968,7 +1062,12 @@ class HoraeManager {
                         if (validEqSlots && validEqSlots.size > 0 && !validEqSlots.has(slotName)) continue;
                         for (const item of items) {
                             const attrStr = Object.entries(item.attrs || {}).map(([k, v]) => `${k}${v >= 0 ? '+' : ''}${v}`).join(',');
-                            const stored = storedEq[name]?.[slotName]?.find(e => e.name === item.name);
+                            const itemId = String(item.itemId || item?._itemMeta?.id || item?._itemMeta?._id || '').replace(/^#/, '');
+                            const stored = storedEq[name]?.[slotName]?.find(entry => {
+                                const storedId = String(entry.itemId || entry?._itemMeta?.id || entry?._itemMeta?._id || '').replace(/^#/, '');
+                                if (itemId && storedId) return itemId === storedId;
+                                return entry.name === item.name;
+                            });
                             const desc = stored?._itemMeta?.description || '';
                             const descPart = desc ? ` "${desc}"` : '';
                             parts.push(`[${slotName}]${item.name}${attrStr ? `{${attrStr}}` : ''}${descPart}`);
@@ -1080,6 +1179,7 @@ class HoraeManager {
             const events = allEvents.filter(e => {
                 if (e.event?._compressedBy && activeSumIds.has(e.event._compressedBy)) return false;
                 if (e.event?._summaryId && !activeSumIds.has(e.event._summaryId)) return false;
+                if (!e.event?.isSummary && e.event?.level !== '摘要' && sameDayEventKeys.has(`${e.messageIndex}:${e.eventIndex}`)) return false;
                 return true;
             });
             if (events.length > 0) {
@@ -1308,7 +1408,7 @@ class HoraeManager {
         // 提取所有 <horae> 块；多块时优先选最靠后的有效块（正文末尾的才是真正输出）
         let match = null;
         const allHoraeMatches = [...message.matchAll(/<horae>([\s\S]*?)<\/horae>/gi)];
-        const horaeFieldPattern = /^(time|timestamp|location|atmosphere|scene_desc|characters|costume|item[!]*|item-|event|affection|npc|agenda|agenda-|rel|mood):/m;
+        const horaeFieldPattern = /^(time|time_context|timestamp|location|atmosphere|scene_desc|characters|costume|item[!]*|item-|item\+|item~|item>|itemx|event|affection|npc|agenda|agenda-|agenda\+|agenda~|agenda!|rel|mood):/m;
         if (allHoraeMatches.length > 1) {
             match = [...allHoraeMatches].reverse().find(m => horaeFieldPattern.test(m[1]))
                  || allHoraeMatches[allHoraeMatches.length - 1];
@@ -1345,14 +1445,55 @@ class HoraeManager {
             deletedAgenda: [],
             mood: {},
             relationships: [],
+            itemLifecycle: [],
+            agendaLifecycle: [],
+            storyClock: {},
         };
         
         for (const line of lines) {
             const trimmedLine = line.trim();
             if (!trimmedLine) continue;
+
+            const memoryProtocol = parseMemoryProtocolLine(trimmedLine);
+            if (memoryProtocol) {
+                if (memoryProtocol.kind === 'item') {
+                    result.itemLifecycle.push(memoryProtocol.record);
+                } else {
+                    result.agendaLifecycle.push(memoryProtocol.record);
+                    // agenda+ 同时保留旧 UI 投影；重放器优先按稳定 ID、旧数据按文本兼容去重。
+                    if (memoryProtocol.record.action === 'add' && memoryProtocol.record.text) {
+                        result.agenda.push({
+                            id: memoryProtocol.record.id || '',
+                            text: memoryProtocol.record.text,
+                            title: memoryProtocol.record.title || memoryProtocol.record.text,
+                            date: memoryProtocol.record.createdAt || '',
+                            createdAt: memoryProtocol.record.createdAt || '',
+                            dueAt: memoryProtocol.record.dueAt || '',
+                            status: memoryProtocol.record.status || 'pending',
+                            source: 'ai',
+                            done: false,
+                        });
+                    }
+                }
+                continue;
+            }
             
+            // time_context:main|confidence=medium / time_context:flashback|confidence=high
+            if (trimmedLine.startsWith('time_context:')) {
+                const contextStr = trimmedLine.substring(13).trim();
+                const parts = contextStr.split('|').map(part => part.trim()).filter(Boolean);
+                result.storyClock.timeline = parts[0] || 'main';
+                for (const part of parts.slice(1)) {
+                    const eq = part.indexOf('=');
+                    if (eq <= 0) continue;
+                    const key = part.substring(0, eq).trim();
+                    const value = part.substring(eq + 1).trim();
+                    if (key === 'confidence') result.storyClock.confidence = value;
+                    if (key === 'source') result.storyClock.source = value;
+                }
+            }
             // time:10/1 15:00 或 time:小镇历永夜2931年 2月1日(五) 20:30
-            if (trimmedLine.startsWith('time:')) {
+            else if (trimmedLine.startsWith('time:')) {
                 const timeStr = trimmedLine.substring(5).trim();
                 // 从末尾分离 HH:MM 时钟时间
                 const clockMatch = timeStr.match(/\b(\d{1,2}:\d{2})\s*$/);
@@ -1621,14 +1762,28 @@ class HoraeManager {
     /** 将解析结果合并到元数据 */
     mergeParsedToMeta(baseMeta, parsed) {
         const meta = baseMeta ? JSON.parse(JSON.stringify(baseMeta)) : createEmptyMeta();
+        meta.schemaVersion = Math.max(Number(meta.schemaVersion) || 1, 2);
+        const hasParsedDate = Object.prototype.hasOwnProperty.call(parsed.timestamp || {}, 'story_date');
+        const hasParsedTime = Object.prototype.hasOwnProperty.call(parsed.timestamp || {}, 'story_time');
         
-        if (parsed.timestamp?.story_date) {
+        if (hasParsedDate) {
             meta.timestamp.story_date = parsed.timestamp.story_date;
         }
-        if (parsed.timestamp?.story_time) {
+        if (hasParsedTime) {
             meta.timestamp.story_time = parsed.timestamp.story_time;
         }
         meta.timestamp.absolute = new Date().toISOString();
+        if (hasParsedDate || hasParsedTime || Object.keys(parsed.storyClock || {}).length > 0) {
+            meta.storyClock = {
+                ...(meta.storyClock || {}),
+                ...(parsed.storyClock || {}),
+                rawDate: hasParsedDate ? parsed.timestamp.story_date : (meta.timestamp.story_date || ''),
+                rawTime: hasParsedTime ? parsed.timestamp.story_time : (meta.timestamp.story_time || ''),
+                confidence: parsed.storyClock?.confidence || 'medium',
+                source: parsed.storyClock?.source || 'horae',
+                timeline: parsed.storyClock?.timeline || 'main',
+            };
+        }
         
         if (parsed.scene?.location) {
             meta.scene.location = parsed.scene.location;
@@ -1654,6 +1809,12 @@ class HoraeManager {
         if (parsed.deletedItems && parsed.deletedItems.length > 0) {
             if (!meta.deletedItems) meta.deletedItems = [];
             meta.deletedItems = [...new Set([...meta.deletedItems, ...parsed.deletedItems])];
+        }
+
+        if (Array.isArray(parsed.itemLifecycle)) {
+            // parsed 表示当前楼层的完整标签结果；替换而不是追加，确保重复
+            // 快速解析、重扫或重新生成不会把数量变化重放多次。
+            meta.itemLifecycle = parsed.itemLifecycle.map(item => ({ ...item }));
         }
         
         // 支持新格式（events数组）和旧格式（单个event）
@@ -1694,6 +1855,11 @@ class HoraeManager {
                     meta.deletedAgenda.push(clean);
                 }
             }
+        }
+
+
+        if (Array.isArray(parsed.agendaLifecycle)) {
+            meta.agendaLifecycle = parsed.agendaLifecycle.map(item => ({ ...item }));
         }
         
         // 关系网络：存入当前消息（后续由 processAIResponse 合并到 chat[0]）
@@ -2108,32 +2274,105 @@ class HoraeManager {
                     locked: !!rpg.equipmentConfig.locked,
                 };
             };
-            const _findAndTakeItem = (name) => {
-                if (readOnly) return null;
-                const state = this.getLatestState();
-                const itemInfo = state?.items?.[name];
-                if (!itemInfo) return null;
-                const meta = { icon: itemInfo.icon || '', description: itemInfo.description || '', importance: itemInfo.importance || '', _id: itemInfo._id || '', _locked: itemInfo._locked || false };
-                for (let k = chat.length - 1; k >= 0; k--) {
-                    if (chat[k]?.horae_meta?.items?.[name]) { delete chat[k].horae_meta.items[name]; break; }
+            const _normalizeItemId = value => String(value ?? '').trim().replace(/^#/, '');
+            const _equippedItemIds = () => {
+                const ids = new Set();
+                for (const slots of Object.values(rpg.equipment || {})) {
+                    for (const entries of Object.values(slots || {})) {
+                        for (const entry of (Array.isArray(entries) ? entries : [])) {
+                            const id = _normalizeItemId(entry?._itemMeta?.id || entry?._itemMeta?._id || entry?.itemId);
+                            if (id) ids.add(id);
+                        }
+                    }
                 }
+                return ids;
+            };
+            const _archiveItemId = (id) => {
+                if (readOnly || !id) return;
+                if (!Array.isArray(first.horae_meta._deletedItemIds)) first.horae_meta._deletedItemIds = [];
+                if (!first.horae_meta._deletedItemIds.includes(id)) first.horae_meta._deletedItemIds.push(id);
+            };
+            const _restoreItemOverride = (item, owner) => {
+                const id = _normalizeItemId(item?.id || item?._id);
+                if (!id || readOnly) return false;
+                if (Array.isArray(first.horae_meta._deletedItemIds)) {
+                    first.horae_meta._deletedItemIds = first.horae_meta._deletedItemIds.filter(value => _normalizeItemId(value) !== id);
+                }
+                if (!Array.isArray(first.horae_meta._itemOverrides)) first.horae_meta._itemOverrides = [];
+                const patch = {
+                    action: 'update',
+                    targetId: id,
+                    name: item.name,
+                    status: 'active',
+                    holder: owner,
+                    location: '',
+                    description: item.description || '',
+                    icon: item.icon || '',
+                    importance: item.importance || '',
+                    _locked: item._locked === true,
+                };
+                const existing = [...first.horae_meta._itemOverrides].reverse().find(entry =>
+                    _normalizeItemId(entry?.targetId || entry?.id || entry?._id) === id
+                );
+                if (existing) Object.assign(existing, patch);
+                else first.horae_meta._itemOverrides.push(patch);
+                return true;
+            };
+            const _findAndTakeItem = (name, preferredId = '') => {
+                const state = this.getLatestState();
+                const allItems = state?._itemMemory?.all || [];
+                const requestedId = _normalizeItemId(preferredId);
+                const idFromName = String(name || '').match(/\[#([^\]]+)\]/)?.[1] || '';
+                const targetId = requestedId || _normalizeItemId(idFromName);
+                const equippedIds = _equippedItemIds();
+                let itemInfo = targetId
+                    ? allItems.find(item => _normalizeItemId(item.id || item._id) === targetId)
+                    : null;
+                if (!itemInfo) {
+                    const requestedName = getItemBaseName(String(name || '').replace(/\s*\[#[^\]]+\]\s*$/, ''));
+                    const candidates = allItems.filter(item =>
+                        getItemBaseName(item.name || item.displayName || '') === requestedName &&
+                        !equippedIds.has(_normalizeItemId(item.id || item._id))
+                    );
+                    itemInfo = candidates.find(item => item.status === 'active') || (readOnly ? candidates[0] : null) || null;
+                }
+                if (!itemInfo) return null;
+                const stableId = _normalizeItemId(itemInfo.id || itemInfo._id);
+                const meta = {
+                    ...itemInfo,
+                    id: stableId,
+                    _id: stableId,
+                    icon: itemInfo.icon || '',
+                    description: itemInfo.description || '',
+                    importance: itemInfo.importance || '',
+                    _locked: itemInfo._locked === true,
+                };
+                _archiveItemId(stableId);
                 return meta;
             };
             const _returnItemFromEquip = (entry, owner) => {
                 if (readOnly) return;
-                if (!first.horae_meta.items) first.horae_meta.items = {};
                 const m = entry._itemMeta || {};
+                if (_restoreItemOverride({ ...m, name: entry.name }, owner)) return;
+                if (!first.horae_meta.items) first.horae_meta.items = {};
                 first.horae_meta.items[entry.name] = {
                     icon: m.icon || '📦', description: m.description || '', importance: m.importance || '',
-                    holder: owner, location: '', _id: m._id || '', _locked: m._locked || false,
+                    holder: owner, location: '', _locked: m._locked === true,
                 };
             };
             for (const u of (changes.unequip || [])) {
                 const owner = this._resolveRpgOwner(u.owner);
                 if (this.settings?.rpgEquipmentUserOnly && owner !== _mUN) continue;
                 if (!rpg.equipment[owner]?.[u.slot]) continue;
-                const removed = rpg.equipment[owner][u.slot].find(e => e.name === u.name);
-                rpg.equipment[owner][u.slot] = rpg.equipment[owner][u.slot].filter(e => e.name !== u.name);
+                const unequipId = _normalizeItemId(u.itemId);
+                const removeIndex = rpg.equipment[owner][u.slot].findIndex(entry => {
+                    if (!unequipId) return entry.name === u.name;
+                    const entryId = _normalizeItemId(entry?._itemMeta?.id || entry?._itemMeta?._id || entry?.itemId);
+                    return entryId === unequipId;
+                });
+                const removed = removeIndex >= 0 ? rpg.equipment[owner][u.slot].splice(removeIndex, 1)[0] : null;
+                const removedId = _normalizeItemId(removed?._itemMeta?.id || removed?._itemMeta?._id || removed?.itemId);
+                if (removedId) u.itemId = removedId;
                 if (removed) _returnItemFromEquip(removed, owner);
                 if (!rpg.equipment[owner][u.slot].length) delete rpg.equipment[owner][u.slot];
                 if (rpg.equipment[owner] && !Object.keys(rpg.equipment[owner]).length) delete rpg.equipment[owner];
@@ -2147,7 +2386,12 @@ class HoraeManager {
                 if (valid.size > 0 && (!valid.has(slotName) || deleted.has(slotName))) continue;
                 if (!rpg.equipment[owner]) rpg.equipment[owner] = {};
                 if (!rpg.equipment[owner][slotName]) rpg.equipment[owner][slotName] = [];
-                const existing = rpg.equipment[owner][slotName].findIndex(e => e.name === eq.name);
+                const equipId = _normalizeItemId(eq.itemId);
+                const existing = rpg.equipment[owner][slotName].findIndex(entry => {
+                    if (!equipId) return entry.name === eq.name;
+                    const entryId = _normalizeItemId(entry?._itemMeta?.id || entry?._itemMeta?._id || entry?.itemId);
+                    return entryId === equipId;
+                });
                 if (existing >= 0) {
                     rpg.equipment[owner][slotName][existing].attrs = eq.attrs;
                 } else {
@@ -2156,8 +2400,13 @@ class HoraeManager {
                         const bumped = rpg.equipment[owner][slotName].shift();
                         if (bumped) _returnItemFromEquip(bumped, owner);
                     }
-                    const itemMeta = _findAndTakeItem(eq.name);
-                    rpg.equipment[owner][slotName].push({ name: eq.name, attrs: eq.attrs || {}, ...(itemMeta ? { _itemMeta: itemMeta } : {}) });
+                    const itemMeta = _findAndTakeItem(eq.name, eq.itemId);
+                    if (itemMeta?.id) eq.itemId = itemMeta.id;
+                    rpg.equipment[owner][slotName].push({
+                        name: itemMeta?.name || eq.name,
+                        attrs: eq.attrs || {},
+                        ...(itemMeta ? { itemId: itemMeta.id, _itemMeta: itemMeta } : {}),
+                    });
                 }
             }
         }
@@ -2472,7 +2721,12 @@ class HoraeManager {
             for (const u of (changes.unequip || [])) {
                 const owner = _resolve(u.owner);
                 if (!snapshot.equipment[owner]?.[u.slot]) continue;
-                snapshot.equipment[owner][u.slot] = snapshot.equipment[owner][u.slot].filter(e => e.name !== u.name);
+                const itemId = String(u.itemId || '').replace(/^#/, '');
+                const removeIndex = snapshot.equipment[owner][u.slot].findIndex(entry => {
+                    if (!itemId) return entry.name === u.name;
+                    return String(entry.itemId || entry?._itemMeta?.id || '').replace(/^#/, '') === itemId;
+                });
+                if (removeIndex >= 0) snapshot.equipment[owner][u.slot].splice(removeIndex, 1);
                 if (!snapshot.equipment[owner][u.slot].length) delete snapshot.equipment[owner][u.slot];
                 if (!Object.keys(snapshot.equipment[owner] || {}).length) delete snapshot.equipment[owner];
             }
@@ -2483,12 +2737,20 @@ class HoraeManager {
                     ? (ownerCfg.slots.find(s => s.name === eq.slot)?.maxCount ?? 1) : 1;
                 if (!snapshot.equipment[owner]) snapshot.equipment[owner] = {};
                 if (!snapshot.equipment[owner][eq.slot]) snapshot.equipment[owner][eq.slot] = [];
-                const idx = snapshot.equipment[owner][eq.slot].findIndex(e => e.name === eq.name);
+                const itemId = String(eq.itemId || '').replace(/^#/, '');
+                const idx = snapshot.equipment[owner][eq.slot].findIndex(entry => {
+                    if (!itemId) return entry.name === eq.name;
+                    return String(entry.itemId || entry?._itemMeta?.id || '').replace(/^#/, '') === itemId;
+                });
                 if (idx >= 0) {
                     snapshot.equipment[owner][eq.slot][idx].attrs = eq.attrs;
                 } else {
                     while (snapshot.equipment[owner][eq.slot].length >= maxCount) snapshot.equipment[owner][eq.slot].shift();
-                    snapshot.equipment[owner][eq.slot].push({ name: eq.name, attrs: eq.attrs || {} });
+                    snapshot.equipment[owner][eq.slot].push({
+                        name: eq.name,
+                        attrs: eq.attrs || {},
+                        ...(itemId ? { itemId, _itemMeta: { id: itemId, _id: itemId } } : {}),
+                    });
                 }
             }
             // 等级/经验
@@ -2725,31 +2987,13 @@ class HoraeManager {
         return rels.filter(r => nameSet.has(r.from) || nameSet.has(r.to));
     }
 
-    /** 全局删除已完成的待办事项 */
+    /**
+     * @deprecated 完成状态现在由当前消息的 deletedAgenda/agendaLifecycle 重放。
+     * 保留空实现供旧调用方兼容，严禁再改写历史楼层的 agenda 真源。
+     */
     removeCompletedAgenda(deletedTexts) {
-        const chat = this.getChat();
-        if (!chat || deletedTexts.length === 0) return;
-
-        const isMatch = (agendaText, deleteText) => {
-            if (!agendaText || !deleteText) return false;
-            // 精确匹配 或 互相包含（允许AI缩写/扩写）
-            return agendaText === deleteText ||
-                   agendaText.includes(deleteText) ||
-                   deleteText.includes(agendaText);
-        };
-
-        if (chat[0]?.horae_meta?.agenda) {
-            chat[0].horae_meta.agenda = chat[0].horae_meta.agenda.filter(
-                a => !deletedTexts.some(dt => isMatch(a.text, dt))
-            );
-        }
-
-        for (let i = 1; i < chat.length; i++) {
-            if (chat[i]?.horae_meta?.agenda?.length > 0) {
-                chat[i].horae_meta.agenda = chat[i].horae_meta.agenda.filter(
-                    a => !deletedTexts.some(dt => isMatch(a.text, dt))
-                );
-            }
+        if (deletedTexts?.length > 0) {
+            console.debug('[Horae] agenda 完成状态已记录为可重放迁移，历史来源保持不变');
         }
     }
 
@@ -3364,7 +3608,8 @@ class HoraeManager {
             'autoSummaries', 'customTables', 'globalTableData', 'charTableData',
             'locationMemory', 'relationships', 'tableContributions',
             'rpg', '_rpgChanges',
-            '_deletedNpcs', '_deletedAgendaTexts',
+            '_deletedNpcs', '_deletedAgendaTexts', '_deletedAgendaIds', '_agendaOverrides',
+            '_deletedItemIds', '_itemOverrides',
             '_rpgConfigs', '_pendingScanReview', '_userAddedNpcs'
         ];
 
@@ -3475,7 +3720,7 @@ class HoraeManager {
         const subs = this.generateLocationMemoryPrompt() + this.generateCustomTablesPrompt() +
                      this.generateRelationshipPrompt() + this.generateMoodPrompt() +
                      this.generateRpgPrompt() + this._generateAntiParaphrasePrompt() +
-                     this._generateCustomCalendarPrompt();
+                     this._generateCustomCalendarPrompt() + this._generateMemoryLifecyclePrompt();
         const fieldLines = this.getPromptFieldLines();
 
         if (this.settings?.customSystemPrompt) {
@@ -3492,6 +3737,37 @@ class HoraeManager {
             .replace(/\{\{user\}\}/gi, userName)
             .replace(/\{\{char\}\}/gi, charName);
         return '\n' + base;
+    }
+
+    /** 无论使用内置还是自定义系统提示词，都追加同一套记忆生命周期规则。 */
+    _generateMemoryLifecyclePrompt() {
+        const lang = this._getAiOutputLang();
+        if (lang === 'zh-CN' || lang === 'zh-TW') {
+            return `
+
+═══ Horae 主线时间与记忆生命周期（高优先级）═══
+· <horae> 中增加 time_context:main|confidence=high/medium/low。当前正文是闪回或回忆时写 time_context:flashback|confidence=...；回到当前剧情立即恢复 main。
+· 时间不明确时沿用最后可靠的主线日期/时刻并把 confidence 降为 low；跨日但时刻未知时只写日期。严禁凭空编造精确日期或时刻。
+· 没有闪回、回忆或明确回溯依据时，禁止让主线日期或时刻倒退。
+· 物品优先使用生命周期协议：item+:name=名称|qty=数量|unit=单位|holder=持有人|location=位置|expiresAt=明确过期时间|decayPolicy=per_day:每日减少量；item~:targetId=ID或name=名称|delta=-2；item>:targetId=ID|holder=新持有人|location=新位置；itemx:targetId=ID或name=名称|status=consumed/lost/destroyed/returned/expired|reason=证据。
+· 计划优先使用生命周期协议：agenda+:text=内容|createdAt=订立时间|dueAt=截止时间|expiresAt=明确失效时间；agenda~:targetId=ID或text=内容|status=in_progress/overdue；agenda!:targetId=ID或text=内容|status=completed/cancelled/expired|evidence=明确剧情证据。
+· dueAt 是截止/计划时间，不是自动清除时间。未来日期尚未到达时必须保持 pending；跨到第二天也不得提前完成、失效或删除几天后的计划。
+· 到达截止时间只可把计划标成 overdue，并继续保留在活跃计划中。只有 expiresAt/endAt 已过，或正文明确完成、取消、失效时才能关闭。
+· 未明确消耗、丢失、转移、归还、损毁或过期的物品必须继续保留；关键物品不能仅因很久未提及而消失。
+`;
+        }
+        return `
+
+=== Horae Main Timeline and Memory Lifecycle (high priority) ===
+· Add time_context:main|confidence=high/medium/low inside <horae>. Use time_context:flashback|confidence=... for memories or flashbacks, and restore main immediately after returning to the present storyline.
+· When time is uncertain, inherit the last reliable main-timeline value and lower confidence to low. If the date advances but the time is unknown, output only the date. Never invent a precise date or time.
+· Do not move the main clock backward without explicit flashback, memory, or rewind evidence.
+· Prefer item lifecycle records: item+:name=...|qty=...|unit=...|holder=...|location=...|expiresAt=explicit expiry|decayPolicy=per_day:daily amount; item~:targetId=...|delta=-2; item>:targetId=...|holder=...|location=...; itemx:targetId=...|status=consumed/lost/destroyed/returned/expired|reason=evidence.
+· Prefer agenda lifecycle records: agenda+:text=...|createdAt=...|dueAt=...|expiresAt=explicit expiry; agenda~:targetId=...|status=in_progress/overdue; agenda!:targetId=...|status=completed/cancelled/expired|evidence=explicit story evidence.
+· dueAt is a due/planned time, not an auto-removal time. Keep future agendas pending across day changes; never complete, expire, or remove a plan before its future date.
+· Passing a deadline only makes an agenda overdue and keeps it active. Close it only after expiresAt/endAt or explicit completion, cancellation, or invalidation in the story.
+· Keep items until consumption, loss, transfer, return, destruction, or expiration is explicit. Important items never disappear merely because they have not been mentioned recently.
+`;
     }
 
     getDefaultSystemPrompt(vars = null) {
@@ -4355,10 +4631,52 @@ class HoraeManager {
             npcs: {},
             scene: {},
             agenda: [],   // 待办事项
-            deletedAgenda: []  // 已完成的待办事项
+            deletedAgenda: [],  // 已完成的待办事项
+            itemLifecycle: [],
+            agendaLifecycle: [],
+            storyClock: {},
         };
 
         let hasAnyData = false;
+
+        for (const rawLine of String(message || '').split('\n')) {
+            const protocol = parseMemoryProtocolLine(rawLine);
+            if (!protocol) continue;
+            if (protocol.kind === 'item') {
+                result.itemLifecycle.push(protocol.record);
+            } else {
+                result.agendaLifecycle.push(protocol.record);
+                if (protocol.record.action === 'add' && protocol.record.text) {
+                    result.agenda.push({
+                        id: protocol.record.id || '',
+                        text: protocol.record.text,
+                        title: protocol.record.title || protocol.record.text,
+                        date: protocol.record.createdAt || '',
+                        createdAt: protocol.record.createdAt || '',
+                        dueAt: protocol.record.dueAt || '',
+                        status: protocol.record.status || 'pending',
+                        source: 'ai',
+                        done: false,
+                    });
+                }
+            }
+            hasAnyData = true;
+        }
+
+        const timeContextMatch = String(message || '').match(/time_context[:：]\s*([^\n]+)/i);
+        if (timeContextMatch) {
+            const parts = timeContextMatch[1].split('|').map(part => part.trim()).filter(Boolean);
+            result.storyClock.timeline = parts[0] || 'main';
+            for (const part of parts.slice(1)) {
+                const eq = part.indexOf('=');
+                if (eq <= 0) continue;
+                const key = part.substring(0, eq).trim();
+                const value = part.substring(eq + 1).trim();
+                if (key === 'confidence') result.storyClock.confidence = value;
+                if (key === 'source') result.storyClock.source = value;
+            }
+            hasAnyData = true;
+        }
 
         const patterns = {
             time: /time[:：]\s*(.+?)(?:\n|$)/gi,

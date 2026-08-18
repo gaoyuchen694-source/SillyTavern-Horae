@@ -684,6 +684,457 @@ body > .horae-port-bottom-bar {
     border-left-color: var(--horae-accent, #f59e0b);
 }
 
+.horae-agenda-item.status-overdue {
+    border-left-color: var(--horae-danger);
+}
+
+/* === 记忆状态与生命周期 === */
+.horae-memory-health {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.horae-health-metric {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 5px;
+    padding: 6px 8px;
+    border: 1px solid var(--horae-border);
+    border-radius: var(--horae-radius-sm);
+    background: var(--horae-bg-secondary);
+    color: var(--horae-text-muted);
+    font-size: 10px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.horae-health-metric i {
+    flex: 0 0 auto;
+    color: var(--horae-info);
+}
+
+.horae-health-metric.confidence-high i {
+    color: var(--horae-success);
+}
+
+.horae-health-metric.confidence-medium i,
+.horae-health-metric.warning i {
+    color: var(--horae-warning);
+}
+
+.horae-health-metric.confidence-low i {
+    color: var(--horae-danger);
+}
+
+.horae-clock-anomaly {
+    margin-top: 8px;
+    padding: 7px 9px;
+    border-left: 3px solid var(--horae-danger);
+    border-radius: var(--horae-radius-sm);
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--horae-text);
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.horae-clock-anomaly[hidden] {
+    display: none;
+}
+
+.horae-lifecycle-badge,
+.horae-item-quantity,
+.horae-calendar-action {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    padding: 1px 5px;
+    border: 1px solid var(--horae-border);
+    border-radius: var(--horae-radius-sm);
+    background: var(--horae-bg-secondary);
+    color: var(--horae-text-muted);
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.horae-lifecycle-badge.active,
+.horae-lifecycle-badge.in_progress,
+.horae-lifecycle-badge.in-progress {
+    border-color: rgba(16, 185, 129, 0.4);
+    background: rgba(16, 185, 129, 0.1);
+    color: var(--horae-success);
+}
+
+.horae-lifecycle-badge.pending,
+.horae-lifecycle-badge.decaying {
+    border-color: rgba(59, 130, 246, 0.4);
+    background: rgba(59, 130, 246, 0.1);
+    color: var(--horae-info);
+}
+
+.horae-lifecycle-badge.overdue,
+.horae-lifecycle-badge.expired {
+    border-color: rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--horae-danger);
+}
+
+.horae-lifecycle-badge.archived {
+    opacity: 0.7;
+}
+
+.horae-item-quantity {
+    border-color: rgba(245, 158, 11, 0.4);
+    background: rgba(245, 158, 11, 0.1);
+    color: var(--horae-accent);
+}
+
+/* === 时间线视图切换与叙事日历 === */
+.horae-timeline-view-switch {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px;
+    margin: 0 0 12px;
+    padding: 2px;
+    border: 1px solid var(--horae-border);
+    border-radius: 6px;
+    background: var(--horae-bg);
+}
+
+.horae-segment-btn {
+    display: inline-flex;
+    min-width: 0;
+    min-height: 34px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--horae-text-muted);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.horae-segment-btn.active {
+    background: var(--horae-bg-hover);
+    color: var(--horae-text);
+    box-shadow: inset 0 -2px 0 var(--horae-primary);
+}
+
+.horae-timeline-view[hidden] {
+    display: none;
+}
+
+.horae-calendar-nav {
+    display: grid;
+    grid-template-columns: 34px minmax(80px, 1fr) auto 34px;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.horae-calendar-nav-btn,
+.horae-calendar-today {
+    display: inline-flex;
+    min-height: 34px;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 5px 8px;
+    border: 1px solid var(--horae-border);
+    border-radius: var(--horae-radius-sm);
+    background: var(--horae-bg);
+    color: var(--horae-text-muted);
+    cursor: pointer;
+}
+
+.horae-calendar-nav-btn:not(:disabled):hover,
+.horae-calendar-today:not(:disabled):hover {
+    border-color: var(--horae-primary);
+    color: var(--horae-text);
+    background: var(--horae-bg-hover);
+}
+
+.horae-calendar-nav-btn:disabled,
+.horae-calendar-today:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+}
+
+.horae-calendar-period {
+    min-width: 0;
+    color: var(--horae-text);
+    font-size: 13px;
+    font-weight: 600;
+    text-align: center;
+    overflow-wrap: anywhere;
+}
+
+.horae-calendar-today {
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.horae-calendar-weekdays,
+.horae-calendar-grid {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 3px;
+}
+
+.horae-calendar-weekdays {
+    margin-bottom: 4px;
+    color: var(--horae-text-muted);
+    font-size: 9px;
+    text-align: center;
+}
+
+.horae-calendar-weekdays[hidden] {
+    display: none;
+}
+
+.horae-calendar-day {
+    position: relative;
+    display: flex;
+    aspect-ratio: 1 / 1;
+    min-width: 0;
+    min-height: 34px;
+    align-items: flex-start;
+    justify-content: flex-start;
+    padding: 5px;
+    overflow: hidden;
+    border: 1px solid var(--horae-border);
+    border-radius: var(--horae-radius-sm);
+    background: var(--horae-bg);
+    color: var(--horae-text-muted);
+    cursor: default;
+}
+
+button.horae-calendar-day.has-records {
+    color: var(--horae-text);
+    cursor: pointer;
+}
+
+.horae-calendar-day.current {
+    border-color: var(--horae-accent);
+}
+
+.horae-calendar-day.selected {
+    border-color: var(--horae-primary-light);
+    background: var(--horae-bg-hover);
+    box-shadow: inset 0 0 0 1px var(--horae-primary-light);
+}
+
+.horae-calendar-day.empty {
+    visibility: hidden;
+}
+
+.horae-calendar-day-number {
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+}
+
+.horae-calendar-day-markers {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    left: 4px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 2px;
+    min-height: 4px;
+}
+
+.horae-calendar-day-markers > span {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--horae-text-muted);
+}
+
+.horae-calendar-day-markers .events { background: var(--horae-info); }
+.horae-calendar-day-markers .agenda { background: var(--horae-success); }
+.horae-calendar-day-markers .items { background: var(--horae-accent); }
+.horae-calendar-day-markers .overdue,
+.horae-calendar-day-markers .anomaly { background: var(--horae-danger); }
+
+.horae-calendar-list {
+    display: grid;
+    gap: 5px;
+}
+
+.horae-calendar-list:empty {
+    display: none;
+}
+
+.horae-calendar-list-day {
+    display: grid;
+    grid-template-columns: minmax(72px, auto) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    min-height: 42px;
+    padding: 7px 9px;
+    border: 1px solid var(--horae-border);
+    border-radius: var(--horae-radius-sm);
+    background: var(--horae-bg);
+    color: var(--horae-text);
+    text-align: left;
+    cursor: pointer;
+}
+
+.horae-calendar-list-day.current {
+    border-left: 3px solid var(--horae-accent);
+}
+
+.horae-calendar-list-day.selected {
+    border-color: var(--horae-primary-light);
+    background: var(--horae-bg-hover);
+}
+
+.horae-calendar-list-summary {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--horae-text-muted);
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.horae-calendar-detail {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--horae-border);
+}
+
+.horae-calendar-detail-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--horae-text);
+}
+
+.horae-calendar-detail-header span,
+.horae-calendar-detail-empty {
+    color: var(--horae-text-muted);
+    font-size: 10px;
+}
+
+.horae-calendar-detail-section + .horae-calendar-detail-section {
+    margin-top: 10px;
+}
+
+.horae-calendar-detail-section h4 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 5px;
+    color: var(--horae-text-muted);
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.horae-calendar-detail-section.anomaly h4 {
+    color: var(--horae-danger);
+}
+
+.horae-calendar-record {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    width: 100%;
+    min-height: 32px;
+    align-items: start;
+    gap: 7px;
+    padding: 6px 8px;
+    border: 0;
+    border-bottom: 1px solid var(--horae-border);
+    border-radius: 0;
+    background: transparent;
+    color: var(--horae-text);
+    font-size: 11px;
+    line-height: 1.4;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+button.horae-calendar-record {
+    cursor: pointer;
+}
+
+button.horae-calendar-record:hover {
+    background: var(--horae-bg-hover);
+}
+
+.horae-calendar-record-time {
+    color: var(--horae-info);
+    font-variant-numeric: tabular-nums;
+}
+
+.horae-calendar-action.agenda { color: var(--horae-success); }
+.horae-calendar-action.items { color: var(--horae-accent); }
+
+#horae_drawer :is(.horae-segment-btn, .horae-calendar-nav-btn, .horae-calendar-today, .horae-calendar-day, .horae-calendar-list-day, .horae-calendar-record):focus-visible {
+    outline: 2px solid var(--horae-primary-light);
+    outline-offset: 2px;
+}
+
+@media screen and (max-width: 600px) {
+    .horae-memory-health {
+        grid-template-columns: 1fr;
+    }
+
+    .horae-segment-btn,
+    .horae-calendar-nav-btn,
+    .horae-calendar-today,
+    .horae-calendar-list-day {
+        min-height: 44px;
+    }
+
+    .horae-calendar-nav {
+        grid-template-columns: 44px minmax(0, 1fr) 44px;
+    }
+
+    .horae-calendar-today {
+        grid-column: 1 / -1;
+        grid-row: 2;
+    }
+
+    .horae-calendar-day {
+        min-height: 38px;
+        padding: 4px;
+    }
+
+    .horae-calendar-list-day {
+        grid-template-columns: 1fr auto;
+    }
+
+    .horae-calendar-list-summary {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        white-space: normal;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #horae_drawer .horae-agenda-item,
+    #horae_drawer .horae-timeline-item,
+    #horae_drawer .horae-segment-btn,
+    #horae_drawer .horae-calendar-record {
+        transition: none !important;
+    }
+
+    #horae_drawer .horae-timeline-item:hover {
+        transform: none;
+    }
+}
+
 /* === 时间线搜索 === */
 .horae-timeline-search-row {
     display: flex;
@@ -1290,12 +1741,19 @@ body > .horae-port-bottom-bar {
 
 .horae-full-item-info {
     flex: 1;
+    min-width: 0;
 }
 
 .horae-full-item-name {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px 5px;
+    min-width: 0;
     font-weight: 600;
     color: var(--horae-text);
     margin-bottom: 2px;
+    overflow-wrap: anywhere;
 }
 
 .horae-full-item-location {
@@ -5575,6 +6033,15 @@ body > .horae-port-bottom-bar {
     font-size: 11px;
     color: var(--horae-text-muted);
     margin-top: 2px;
+}
+
+.horae-review-item-desc {
+    font-style: italic;
+    opacity: 0.8;
+}
+
+.horae-review-item-desc i {
+    margin-right: 3px;
 }
 
 .horae-review-item-msg {

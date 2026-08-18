@@ -11,17 +11,16 @@
 ═══ 标签格式 ═══
 每次回复末尾必须写入两个标签：
 <horae>
-time:日期 时间（必填）
+time:最后可靠的主线日期 时间（必填；时间不确定时继承可靠值，跨日但时刻未知时只写日期）
+time_context:main或flashback|confidence=high/medium/low（必填）
 location:地点（必填。多级地点用·分隔，如「酒馆·大厅」「皇宫·王座间」。同一地点每次必须使用完全一致的名称）
 atmosphere:氛围${sceneDescLine}
 characters:在场角色名,逗号分隔（必填）
 costume:角色名=服装描述（必填，每人一行，禁止分号合并）
-item/item!/item!!:见物品规则（触发时才写）
-item-:物品名（物品消耗/丢失时删除。见物品规则，触发时才写）
+item+/item~/item>/itemx:见物品生命周期规则（触发时才写；旧item/item-/item!/item!!格式仍兼容）
 affection:角色名=好感度（★NPC首次出场必填初始值！之后仅好感变化时更新）
 npc:角色名|外貌=性格@关系~扩展字段（★NPC首次出场必填完整信息！之后仅变化时更新）
-agenda:日期|内容（新待办触发时才写）
-agenda-:内容关键词（待办已完成/失效时才写，系统自动移除匹配的待办）${relLine}${moodLine}
+agenda+/agenda~/agenda!:见计划生命周期规则（触发时才写；旧agenda/agenda-格式仍兼容）${relLine}${moodLine}
 </horae>
 <horaeevent>
 event:重要程度|事件简述（30-50字，重要程度：一般/重要/关键，记录本条消息中的事件摘要，用于剧情追溯）
@@ -30,20 +29,29 @@ event:重要程度|事件简述（30-50字，重要程度：一般/重要/关键
 ═══ 【物品】触发条件与规则 ═══
 参照[物品清单]中的编号(#ID)，严格按以下条件决定是否输出。
 
+【优先格式】
+  新增：item+:name=物品名|qty=数量|unit=单位|holder=持有人|location=精确位置|description=描述|expiresAt=明确过期时间|decayPolicy=per_day:每日减少量
+  数量/属性变化：item~:targetId=ID或name=物品名|delta=-2|holder=持有人|location=位置
+  转移：item>:targetId=ID或name=物品名|holder=新持有人|location=新位置
+  关闭：itemx:targetId=ID或name=物品名|status=consumed/depleted/lost/destroyed/returned/expired|reason=正文证据
+  没有明确变化时不得输出；关键物品不能仅因长期未提及而消失。
+
 【何时写】（满足任一条件才输出）
-  ✦ 获得新物品 → item:/item!:/item!!:
-  ✦ 已有物品的数量/归属/位置/性质发生改变 → item:（仅写变化部分）
-  ✦ 物品消耗/丢失/用完 → item-:物品名
+  ✦ 获得新物品 → item+
+  ✦ 已有物品的数量/性质发生改变 → item~（仅写变化字段）
+  ✦ 物品的持有者或位置改变 → item>
+  ✦ 物品消耗/丢失/用完/损毁/归还/到期 → itemx（必须写正文证据）
 【何时不写】
   ✗ 物品无任何变化 → 禁止输出任何item行
   ✗ 物品仅被提及但无状态改变 → 不写
 
 【格式】
-  新获得：item:emoji物品名(数量)|描述=持有者@精确位置（可省略描述字段。除非该物品有特殊含意，如礼物、纪念品，则添加描述）
-  新获得(重要)：item!:emoji物品名(数量)|描述=持有者@精确位置（重要物品，描述必填：外观+功能+来源）
-  新获得(关键)：item!!:emoji物品名(数量)|描述=持有者@精确位置（关键道具，描述必须详细）
-  已有物品变化：item:emoji物品名(新数量)=新持有者@新位置（仅更新变化的部分，不写|则保留原描述）
-  消耗/丢失：item-:物品名
+  新获得：item+:name=物品名|qty=数量|unit=单位|holder=持有者|location=精确位置|description=描述
+  新获得(重要)：在item+中增加importance=important，并完整记录外观、功能和来源
+  新获得(关键)：在item+中增加importance=critical，并详细记录外观、功能和来源
+  已有物品量变：item~:targetId=ID或name=物品名|delta=数量变化
+  转移：item>:targetId=ID或name=物品名|holder=新持有者|location=新位置
+  消耗/丢失：itemx:targetId=ID或name=物品名|status=consumed/lost|reason=正文证据
 
 【字段级规则】
   · 描述：记录物品本质属性（外观/功能/来源），普通物品可省略，重要/关键物品首次必填
@@ -51,10 +59,10 @@ event:重要程度|事件简述（30-50字，重要程度：一般/重要/关键
     ★ 功能/用途
     ★ 来源（谁给的/如何获得）
        - 示例（以下内容中若有示例仅为示范，勿直接原句用于正文！）：
-         - 示例1：item!:🌹永生花束|深红色玫瑰永生花，黑色缎带束扎，C赠送给U的情人节礼物=U@U房间书桌上
-         - 示例2：item!:🎫幸运十连抽券|闪着金光的纸质奖券，可在系统奖池进行一次十连抽的新手福利=U@空间戒指
-         - 示例3：item!!:🏧位面货币自动兑换机|看起来像个小型的ATM机，能按即时汇率兑换各位面货币=U@酒馆吧台
-  · 数量：单件不写(1)/(1个)/(1把)等，只有计量单位才写括号如(5斤)(1L)(1箱)
+         - 示例1：item+:name=永生花束|qty=1|unit=束|holder=U|location=U房间书桌上|description=深红色玫瑰永生花，黑色缎带束扎，C赠送给U的情人节礼物|importance=important
+         - 示例2：item+:name=幸运十连抽券|qty=1|unit=张|holder=U|location=空间戒指|description=闪着金光的纸质奖券，可在系统奖池进行一次十连抽的新手福利|importance=important
+         - 示例3：item+:name=位面货币自动兑换机|qty=1|unit=台|holder=U|location=酒馆吧台|description=小型ATM机外观，能按即时汇率兑换各位面货币|importance=critical
+  · 数量：原文可确认时写qty和unit；数量不明时省略，严禁猜测
   · 位置：必须是精确固定地点
     ❌ 某某人身前地上、某某人脚边、某某人旁边、地板、桌子上
     ✅ 酒馆大厅地板、餐厅吧台上、家中厨房、背包里、U的房间桌子上
@@ -63,9 +71,9 @@ event:重要程度|事件简述（30-50字，重要程度：一般/重要/关键
 
 
 示例（麦酒生命周期）：
-  获得：item:🍺陈酿麦酒(50L)|杂物间翻出的麦酒，口感酸涩=U@酒馆后厨食材柜
-  量变：item:🍺陈酿麦酒(25L)=U@酒馆后厨食材柜
-  用完：item-:陈酿麦酒
+  获得：item+:name=陈酿麦酒|qty=50|unit=L|holder=U|location=酒馆后厨食材柜|description=杂物间翻出的麦酒，口感酸涩
+  量变：item~:name=陈酿麦酒|delta=-25
+  用完：itemx:name=陈酿麦酒|status=depleted|reason=剩余麦酒已全部饮用
 
 ═══ 【NPC】触发条件与规则 ═══
 格式：npc:名|外貌=性格@与{{user}}的关系~性别:值~年龄:值~种族:值~职业:值~生日:值
@@ -113,25 +121,27 @@ event:重要程度|事件简述（30-50字，重要程度：一般/重要/关键
 
 ═══ 【待办事项】触发条件 ═══
 【何时写（新增）】
-  ✦ 剧情中出现新的约定/计划/行程/任务/伏笔 → agenda:日期|内容
-  格式：agenda:订立日期|内容（相对时间须括号标注绝对日期）
-  示例：agenda:2026/02/10|艾伦邀请{{user}}情人节晚上约会(2026/02/14 18:00)
-【何时写（完成删除）— 极重要！】
-  ✦ 待办事项已完成/已失效/已取消 → 必须用 agenda-: 标记删除
-  格式：agenda-:待办内容（写入已完成事项的内容关键词即可自动移除）
-  示例：agenda-:艾伦邀请{{user}}情人节晚上约会
-  ⚠ 严禁用 agenda:内容(完成) 这种方式！必须用 agenda-: 前缀！
+  ✦ 剧情中出现新的约定/计划/行程/任务/伏笔 → agenda+
+  格式：agenda+:text=内容|createdAt=订立时间|dueAt=截止时间|expiresAt=明确失效时间
+  示例：agenda+:text=艾伦邀请{{user}}情人节晚上约会|createdAt=2026/02/10|dueAt=2026/02/14 18:00
+【何时写（状态变化）— 极重要！】
+  ✦ 开始执行/逾期 → agenda~:targetId=ID或text=内容|status=in_progress/overdue
+  ✦ 已完成/已失效/已取消 → agenda!:targetId=ID或text=内容|status=completed/expired/cancelled|evidence=正文证据
+  ⚠ dueAt是截止/计划时间，不是失效时间。未来日期未到时必须保持pending，跨到第二天也不得提前完成、失效或删除几天后的计划。
+  ⚠ 到达dueAt后只能标为overdue，并继续保留在活跃计划中。
+  ⚠ 只有expiresAt/endAt已过，或本轮正文明确完成、取消、失效时才能关闭。
   ⚠ 严禁重复写入已存在的待办内容！
 【何时不写】
   ✗ 已有待办无变化 → 禁止每回合重复已有待办
-  ✗ 待办已完成 → 禁止用 agenda: 加括号标注完成，必须用 agenda-:
+  ✗ 待办没有明确完成证据 → 禁止输出completed
 
 ═══ 时间格式规则 ═══
 禁止"Day 1"/"第X天"等模糊格式，必须使用具体日历日期。
 - 现代：年/月/日 时:分（如 2026/2/4 15:00）
 - 历史：该年代日期（如 1920/3/15 14:00）
 - 奇幻/架空：该世界观日历（如 霜降月第三日 黄昏）
-- 在无法确定时间时，请编一个合理的具体时间，禁止使用“未知”，“某日”等无意义表述
+- 无法确定时间时沿用参考状态中的最后可靠主线时间并将confidence降为low；跨日但时刻未知时只写日期，严禁编造精确日期或时刻
+- 闪回/回忆写time_context:flashback，恢复当前剧情后写time_context:main；无明确回溯依据时禁止主线时间倒退
 
 ${systemPromptAddition}
 ═══ 最终强制提醒 ═══
@@ -140,6 +150,7 @@ ${systemPromptAddition}
 
 【每回合必写字段——缺任何一项=不合格！】
   ✅ time: ← 当前日期时间
+  ✅ time_context: ← main或flashback及置信度
   ✅ location: ← 当前地点
   ✅ atmosphere: ← 氛围
   ✅ characters: ← 当前在场所有角色名，逗号分隔（绝对不能省略！）

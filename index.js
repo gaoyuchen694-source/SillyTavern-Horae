@@ -3,14 +3,20 @@
  * 基于时间锚点的AI记忆增强系统
  * 
  * 作者: SenriYuki
- * 版本: 1.15.1
+ * 版本: 1.17.0
  */
 
 import { renderExtensionTemplateAsync, getContext, extension_settings } from '/scripts/extensions.js';
 import { getSlideToggleOptions, saveSettingsDebounced, eventSource, event_types, doNewChat } from '/script.js';
 import { slideToggle } from '/lib.js';
 
-import { horaeManager, createEmptyMeta, getItemBaseName } from './core/horaeManager.js';
+import { composeHoraeInjectionPrompt, horaeManager, createEmptyMeta, getItemBaseName } from './core/horaeManager.js';
+import {
+    getAddedAiScanRecordIndices,
+    markAiScannedMeta,
+    mergeAiScanRecords,
+    restoreAiScannedMeta,
+} from './core/aiScanState.js';
 import { vectorManager } from './core/vectorManager.js';
 import { calculateRelativeTime, calculateDetailedRelativeTime, formatRelativeTime, generateTimeReference, getCurrentSystemTime, formatStoryDate, formatFullDateTime, parseStoryDate } from './utils/timeUtils.js';
 import { t, tForLang, initI18n, getLanguage, isZhLocale, setLanguage, detectEffectiveAiLangIsZh, detectEffectiveAiLang } from './core/i18n.js';
@@ -22,7 +28,7 @@ import { initPromptDefaults, ensurePromptDefaults, ensurePresetPrompts, getPromp
 const EXTENSION_NAME = 'horae';
 const EXTENSION_FOLDER = `third-party/SillyTavern-Horae`;
 const TEMPLATE_PATH = `${EXTENSION_FOLDER}/assets/templates`;
-const VERSION = '1.15.1';
+const VERSION = '1.17.0';
 
 // settings 来源标记。仅用于区分「上次写入是否本版本自身」，外部来源（旧版本/其他分发版）会触发一次确认弹窗
 const ENGINE_TAG = 'horae-official';
@@ -132,11 +138,13 @@ const DEFAULT_SETTINGS = {
     pinnedNpcs: [],    // 用户手动标记的重要角色列表（特殊边框）
     // 发送给AI的内容控制
     sendTimeline: true,    // 发送剧情轨迹（关闭则无法计算相对时间）
+    sendSameDayMemory: true, // 发送当前剧情日的完整权威记忆账本
     contextDepth: 15,      // 一般级别剧情轨迹数量
     sendCharacters: true,  // 发送角色信息（服装、好感度）
     sendCharacterAffection: true,        // 单独控制好感度注入
     sendMainCharacterPersonality: true,  // 关闭后主要角色（卡片本体 + 置顶 NPC）的性格简述不再注入
     sendItems: true,       // 发送物品栏
+    sendAgenda: true,      // 发送仍然活跃的计划及截止时间
     panelLayoutStyle: 'classic',         // 'classic' = 默认 / 'glass' = 半透明玻璃 / 'obsidian' = 曜石简约 / 'cyber' = 赛博
     customTables: [],      // 自定义表格 [{id, name, rows, cols, data, prompt}]
     customSystemPrompt: '',      // 自定义系统注入提示词（空=使用默认）
@@ -303,7 +311,7 @@ const PRESERVED_KEYS_ON_RESET = [
 const _SETTINGS_EXPORT_KEYS = [
     'enabled', 'autoParse', 'autoFillPrevTimelineOnSend', 'injectContext', 'useMainPresetForAiTasks', 'showMessagePanel', 'showTopIcon',
     'injectionDepthSource', 'injectionPosition', 'timelineInjectionMode',
-    'sendTimeline', 'contextDepth', 'sendCharacters', 'sendItems',
+    'sendTimeline', 'sendSameDayMemory', 'contextDepth', 'sendCharacters', 'sendItems', 'sendAgenda',
     'sendLocationMemory', 'sendRelationships', 'sendMood',
     'antiParaphraseMode', 'sideplayMode',
     'aiScanIncludeNpc', 'aiScanIncludeAffection', 'aiScanIncludeScene', 'aiScanIncludeRelationship',
@@ -342,15 +350,18 @@ let _vectorEnsureIndexChatId = null;
 // 记录上一次已知的 chat 数组引用快照，删除楼层时通过对比定位被删的最早索引
 let _lastChatMessageRefs = [];
 let itemsMultiSelectMode = false;  // 物品多选模式
-let selectedItems = new Set();     // 选中的物品名称
+let selectedItems = new Set();     // 选中的物品稳定 ID
 let agendaMultiSelectMode = false; // 待办多选模式
-let selectedAgendaIndices = new Set(); // 选中的待办索引
+let selectedAgendaIds = new Set(); // 选中的待办稳定 ID
 let agendaLongPressTimer = null;   // 待办长按计时器
 let npcMultiSelectMode = false;     // NPC多选模式
 let selectedNpcs = new Set();       // 选中的NPC名称
 let timelineMultiSelectMode = false; // 时间线多选模式
 let selectedTimelineEvents = new Set(); // 选中的事件（"msgIndex-eventIndex"格式）
 let timelineLongPressTimer = null;  // 时间线长按计时器
+let timelineViewMode = 'calendar';  // 时间线页内部视图
+let calendarCursor = null;          // 当前浏览的剧情月份（不改变故事时钟）
+let selectedCalendarDayKey = '';
 const _hideUnhideDebugStats = {
     hide: 0,
     unhide: 0,
@@ -551,6 +562,11 @@ function applyI18nToDOM(root) {
         const key = el.getAttribute('data-i18n-placeholder');
         const translated = t(key);
         if (translated && translated !== key) el.placeholder = translated;
+    });
+    container.querySelectorAll('[data-i18n-label]').forEach(el => {
+        const key = el.getAttribute('data-i18n-label');
+        const translated = t(key);
+        if (translated && translated !== key) el.setAttribute('aria-label', translated);
     });
 }
 
@@ -1969,51 +1985,107 @@ function setUserAgenda(agenda) {
  * 每项: { text, date, source: 'user'|'ai', done, createdAt, _msgIndex? }
  */
 function getAllAgenda() {
-    const all = [];
-
-    // 1. 用户手动创建的
-    const userItems = getUserAgenda();
-    for (const item of userItems) {
-        if (item._deleted) continue;
-        all.push({
-            text: item.text,
-            date: item.date || '',
-            source: item.source || 'user',
-            done: !!item.done,
-            createdAt: item.createdAt || 0,
-            _store: 'user',
-            _index: all.length
-        });
-    }
-
-    // 2. AI写入的（存储在各条消息的 horae_meta.agenda）
-    const context = getContext();
-    if (context?.chat) {
-        for (let i = 1; i < context.chat.length; i++) {
-            const meta = context.chat[i].horae_meta;
-            if (meta?.agenda?.length > 0) {
-                for (const item of meta.agenda) {
-                    if (item._deleted) continue;
-                    // 去重：检查是否已存在相同内容
-                    const isDupe = all.some(a => a.text === item.text);
-                    if (!isDupe) {
-                        all.push({
-                            text: item.text,
-                            date: item.date || '',
-                            source: 'ai',
-                            done: !!item.done,
-                            createdAt: item.createdAt || 0,
-                            _store: 'msg',
-                            _msgIndex: i,
-                            _index: all.length
-                        });
-                    }
-                }
+    const statusOrder = { overdue: 0, in_progress: 1, pending: 2 };
+    return (horaeManager.getAgendaState()?.active || []).map((item, index) => ({
+        ...item,
+        text: item.text || item.title || '',
+        date: item.date || item.createdAt || '',
+        source: item.source || (item._msgIndex === 0 ? 'user' : 'ai'),
+        done: false,
+        status: item.status || 'pending',
+        _index: index,
+    })).sort((left, right) => {
+        const statusDiff = (statusOrder[left.status] ?? 9) - (statusOrder[right.status] ?? 9);
+        if (statusDiff) return statusDiff;
+        if (left.dueAt && right.dueAt) {
+            const dayDiff = calculateRelativeTime(left.dueAt, right.dueAt);
+            if (Number.isFinite(dayDiff) && dayDiff !== -999 && dayDiff !== 0) return dayDiff;
+            const leftTime = left.dueAt.match(/(\d{1,2})[:：](\d{2})/);
+            const rightTime = right.dueAt.match(/(\d{1,2})[:：](\d{2})/);
+            if (leftTime && rightTime) {
+                const leftMinutes = Number(leftTime[1]) * 60 + Number(leftTime[2]);
+                const rightMinutes = Number(rightTime[1]) * 60 + Number(rightTime[2]);
+                if (leftMinutes !== rightMinutes) return leftMinutes - rightMinutes;
             }
+        } else if (left.dueAt || right.dueAt) {
+            return left.dueAt ? -1 : 1;
         }
-    }
+        return (left._msgIndex ?? 0) - (right._msgIndex ?? 0) || left._index - right._index;
+    });
+}
 
-    return all;
+function appendAgendaOverride(agendaItem, patch) {
+    const context = getContext();
+    if (!context?.chat?.length) return;
+    if (!context.chat[0].horae_meta) context.chat[0].horae_meta = createEmptyMeta();
+    const meta = context.chat[0].horae_meta;
+    if (!Array.isArray(meta._agendaOverrides)) meta._agendaOverrides = [];
+    const targetId = String(agendaItem.id || '').replace(/^#/, '').trim();
+    const targetText = agendaItem.text || agendaItem.title || '';
+    const existing = [...meta._agendaOverrides].reverse().find(entry =>
+        (targetId && String(entry.targetId || entry.id || '') === targetId) ||
+        (!targetId && entry.text === targetText)
+    );
+    if (existing) {
+        Object.assign(existing, patch, { action: 'update', targetId: targetId || existing.targetId, text: patch.text || targetText });
+    } else {
+        meta._agendaOverrides.push({ action: 'update', targetId, text: targetText, ...patch });
+    }
+}
+
+function appendItemOverride(item, patch) {
+    const context = getContext();
+    if (!context?.chat?.length || !item) return;
+    if (!context.chat[0].horae_meta) context.chat[0].horae_meta = createEmptyMeta();
+    const meta = context.chat[0].horae_meta;
+    if (!Array.isArray(meta._itemOverrides)) meta._itemOverrides = [];
+    const targetId = String(item.id || item._id || '').replace(/^#/, '').trim();
+    const targetName = item.name || item.displayName || '';
+    const existing = [...meta._itemOverrides].reverse().find(entry =>
+        (targetId && String(entry.targetId || entry.id || '') === targetId) ||
+        (!targetId && (entry.name || entry.text) === targetName)
+    );
+    if (existing) {
+        Object.assign(existing, patch, {
+            action: patch.action || 'update',
+            targetId: targetId || existing.targetId,
+            name: patch.name !== undefined ? patch.name : (existing.name || targetName),
+        });
+    } else {
+        meta._itemOverrides.push({ action: 'update', targetId, name: targetName, ...patch });
+    }
+}
+
+function archiveItem(item) {
+    const context = getContext();
+    if (!context?.chat?.length || !item) return;
+    if (!context.chat[0].horae_meta) context.chat[0].horae_meta = createEmptyMeta();
+    const meta = context.chat[0].horae_meta;
+    const targetId = String(item.id || item._id || '').replace(/^#/, '').trim();
+    if (targetId) {
+        if (!Array.isArray(meta._deletedItemIds)) meta._deletedItemIds = [];
+        if (!meta._deletedItemIds.includes(targetId)) meta._deletedItemIds.push(targetId);
+        return;
+    }
+    appendItemOverride(item, { action: 'close', status: 'archived', reason: 'user-panel' });
+}
+
+function restoreArchivedItem(item, patch = {}) {
+    const context = getContext();
+    if (!context?.chat?.length || !item) return;
+    if (!context.chat[0].horae_meta) context.chat[0].horae_meta = createEmptyMeta();
+    const meta = context.chat[0].horae_meta;
+    const targetId = String(item.id || item._id || '').replace(/^#/, '').trim();
+    if (targetId && Array.isArray(meta._deletedItemIds)) {
+        meta._deletedItemIds = meta._deletedItemIds.filter(id => String(id) !== targetId);
+    }
+    appendItemOverride(item, { status: 'active', ...patch });
+}
+
+function getMemoryItemById(itemId, includeArchived = false) {
+    const memory = horaeManager.getMemoryState().items;
+    const source = includeArchived ? memory.all : memory.active;
+    return source.find(item => String(item.id || item._id || '') === String(itemId || '')) || null;
 }
 
 /**
@@ -2022,25 +2094,11 @@ function getAllAgenda() {
 function toggleAgendaDone(agendaItem, done) {
     const context = getContext();
     if (!context?.chat) return;
-
-    if (agendaItem._store === 'user') {
-        const agenda = getUserAgenda();
-        // 按text查找（更可靠）
-        const found = agenda.find(a => a.text === agendaItem.text);
-        if (found) {
-            found.done = done;
-            setUserAgenda(agenda);
-        }
-    } else if (agendaItem._store === 'msg') {
-        const msg = context.chat[agendaItem._msgIndex];
-        if (msg?.horae_meta?.agenda) {
-            const found = msg.horae_meta.agenda.find(a => a.text === agendaItem.text);
-            if (found) {
-                found.done = done;
-                getContext().saveChat();
-            }
-        }
-    }
+    appendAgendaOverride(agendaItem, {
+        status: done ? 'completed' : 'pending',
+        evidence: done ? 'user-panel' : 'user-panel-reopen',
+    });
+    getContext().saveChat();
 }
 
 /**
@@ -2049,28 +2107,21 @@ function toggleAgendaDone(agendaItem, done) {
 function deleteAgendaItem(agendaItem) {
     const context = getContext();
     if (!context?.chat) return;
-    const targetText = agendaItem.text;
+    const targetText = agendaItem.text || agendaItem.title || '';
+    const targetId = String(agendaItem.id || '').replace(/^#/, '').trim();
 
-    // 标记所有匹配项为 _deleted（防止其他消息中同名项复活）
-    if (context.chat[0]?.horae_meta?.agenda) {
-        for (const a of context.chat[0].horae_meta.agenda) {
-            if (a.text === targetText) a._deleted = true;
-        }
-    }
-    for (let i = 1; i < context.chat.length; i++) {
-        const meta = context.chat[i]?.horae_meta;
-        if (meta?.agenda?.length > 0) {
-            for (const a of meta.agenda) {
-                if (a.text === targetText) a._deleted = true;
-            }
-        }
-    }
-
-    // 同时记录已删除文本到 chat[0]，供 rebuild 时参考
+    // 用户归档是独立覆盖层，不再破坏性修改任何历史楼层。
     if (!context.chat[0].horae_meta) context.chat[0].horae_meta = createEmptyMeta();
-    if (!context.chat[0].horae_meta._deletedAgendaTexts) context.chat[0].horae_meta._deletedAgendaTexts = [];
-    if (!context.chat[0].horae_meta._deletedAgendaTexts.includes(targetText)) {
-        context.chat[0].horae_meta._deletedAgendaTexts.push(targetText);
+    if (targetId) {
+        if (!Array.isArray(context.chat[0].horae_meta._deletedAgendaIds)) context.chat[0].horae_meta._deletedAgendaIds = [];
+        if (!context.chat[0].horae_meta._deletedAgendaIds.includes(targetId)) {
+            context.chat[0].horae_meta._deletedAgendaIds.push(targetId);
+        }
+    } else if (targetText) {
+        if (!Array.isArray(context.chat[0].horae_meta._deletedAgendaTexts)) context.chat[0].horae_meta._deletedAgendaTexts = [];
+        if (!context.chat[0].horae_meta._deletedAgendaTexts.includes(targetText)) {
+            context.chat[0].horae_meta._deletedAgendaTexts.push(targetText);
+        }
     }
     getContext().saveChat();
 }
@@ -2158,11 +2209,316 @@ function importTable(file) {
 // UI 渲染函数
 // ============================================
 
+function formatLifecycleQuantity(item) {
+    const value = item?.quantity?.value;
+    if (value === null || value === undefined) return '';
+    return `${value}${item.quantity?.unit || ''}`;
+}
+
+function setTimelineView(mode) {
+    timelineViewMode = mode === 'events' ? 'events' : 'calendar';
+    document.querySelectorAll('[data-timeline-view]').forEach(button => {
+        const active = button.dataset.timelineView === timelineViewMode;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+        button.setAttribute('tabindex', active ? '0' : '-1');
+    });
+    const calendarView = document.getElementById('horae-calendar-view');
+    const eventsView = document.getElementById('horae-events-view');
+    if (calendarView) {
+        calendarView.hidden = timelineViewMode !== 'calendar';
+        calendarView.classList.toggle('active', timelineViewMode === 'calendar');
+    }
+    if (eventsView) {
+        eventsView.hidden = timelineViewMode !== 'events';
+        eventsView.classList.toggle('active', timelineViewMode === 'events');
+    }
+    if (timelineViewMode === 'calendar') updateCalendarDisplay();
+    else updateTimelineDisplay();
+}
+
+function getCalendarPeriod(calendar) {
+    const current = parseStoryDate(calendar?.clock?.rawDate || '');
+    if (!current || (current.type !== 'standard' && current.type !== 'custom')) return null;
+    const type = current.type;
+    const monthIndex = type === 'standard' ? current.month - 1 : current.monthIndex;
+    if (!calendarCursor || calendarCursor.type !== type) {
+        calendarCursor = { type, year: current.year ?? null, monthIndex };
+    }
+    return calendarCursor;
+}
+
+function calendarDayInPeriod(day, cursor) {
+    if (!day || !cursor || day.calendarType !== cursor.type) return false;
+    const monthIndex = cursor.type === 'standard' ? Number(day.month) - 1 : Number(day.monthIndex);
+    if (monthIndex !== cursor.monthIndex) return false;
+    if (cursor.year !== null && day.year !== null && Number(day.year) !== cursor.year) return false;
+    return true;
+}
+
+function getCalendarDayRecordCount(day) {
+    return (day?.events?.length || 0) + (day?.agendaChanges?.length || 0)
+        + (day?.agendaDue?.length || 0) + (day?.itemChanges?.length || 0)
+        + (day?.anomalies?.length || 0);
+}
+
+function renderCalendarMarkers(day) {
+    const markers = [];
+    if (day.events?.length) markers.push(`<span class="events" title="${escapeHtml(t('timeline.eventsCount', { n: day.events.length }))}"></span>`);
+    const overdue = (day.agendaDue || []).filter(item => item.status === 'overdue').length;
+    if (overdue) markers.push(`<span class="overdue" title="${escapeHtml(t('lifecycle.overdue'))}"></span>`);
+    else if ((day.agendaChanges?.length || 0) + (day.agendaDue?.length || 0) > 0) markers.push(`<span class="agenda" title="${escapeHtml(t('timeline.agendaChanges'))}"></span>`);
+    if (day.itemChanges?.length) markers.push(`<span class="items" title="${escapeHtml(t('timeline.itemChanges'))}"></span>`);
+    if (day.anomalies?.length) markers.push(`<span class="anomaly" title="${escapeHtml(t('timeline.timeAnomalies'))}"></span>`);
+    return `<span class="horae-calendar-day-markers">${markers.join('')}</span>`;
+}
+
+function formatCalendarAction(action) {
+    const key = {
+        add: 'timeline.actionAdd',
+        create: 'timeline.actionAdd',
+        update: 'timeline.actionUpdate',
+        snapshot: 'timeline.actionUpdate',
+        close: 'timeline.actionClose',
+        complete: 'timeline.actionClose',
+        expiry: 'timeline.actionExpiry',
+    }[String(action || '').toLowerCase()];
+    return key ? t(key) : (action || t('timeline.actionUpdate'));
+}
+
+function updateCalendarDetail(day) {
+    const detailEl = document.getElementById('horae-calendar-detail');
+    if (!detailEl) return;
+    if (!day) {
+        detailEl.innerHTML = `<div class="horae-calendar-detail-empty">${escapeHtml(t('timeline.noDayRecords'))}</div>`;
+        return;
+    }
+
+    const sections = [];
+    if (day.events?.length) {
+        sections.push(`
+            <section class="horae-calendar-detail-section">
+                <h4><i class="fa-solid fa-timeline"></i>${escapeHtml(t('timeline.eventsCount', { n: day.events.length }))}</h4>
+                ${day.events.map(event => `
+                    <button type="button" class="horae-calendar-record" data-calendar-message="${Number(event.messageIndex)}">
+                        <span class="horae-calendar-record-time">${escapeHtml(event.time || '')}</span>
+                        <span>${escapeHtml(event.summary)}</span>
+                    </button>`).join('')}
+            </section>`);
+    }
+    if (day.agendaChanges?.length || day.agendaDue?.length) {
+        const changes = (day.agendaChanges || []).map(item => `
+            <div class="horae-calendar-record static">
+                <span class="horae-calendar-action agenda">${escapeHtml(formatCalendarAction(item.action))}</span>
+                <span>${escapeHtml(item.text || t('ui.noRecorded'))}</span>
+            </div>`).join('');
+        const due = (day.agendaDue || []).map(item => `
+            <div class="horae-calendar-record static">
+                <span class="horae-lifecycle-badge ${escapeHtml(item.status || 'pending')}">${escapeHtml(t(item.status === 'overdue' ? 'lifecycle.overdue' : 'timeline.agendaDue'))}</span>
+                <span>${escapeHtml(item.text || t('ui.noRecorded'))}</span>
+            </div>`).join('');
+        sections.push(`
+            <section class="horae-calendar-detail-section">
+                <h4><i class="fa-solid fa-list-check"></i>${escapeHtml(t('timeline.agendaChanges'))}</h4>
+                ${changes}${due}
+            </section>`);
+    }
+    if (day.itemChanges?.length) {
+        sections.push(`
+            <section class="horae-calendar-detail-section">
+                <h4><i class="fa-solid fa-box-open"></i>${escapeHtml(t('timeline.itemChanges'))}</h4>
+                ${day.itemChanges.map(item => {
+                    const quantity = item.quantity && typeof item.quantity === 'object'
+                        ? item.quantity.value
+                        : item.quantity;
+                    const quantityText = quantity !== null && quantity !== undefined
+                        ? ` ${quantity}${item.unit || item.quantity?.unit || ''}`
+                        : (item.delta !== null && item.delta !== undefined ? ` ${Number(item.delta) >= 0 ? '+' : ''}${item.delta}` : '');
+                    return `<div class="horae-calendar-record static">
+                        <span class="horae-calendar-action items">${escapeHtml(formatCalendarAction(item.action))}</span>
+                        <span>${escapeHtml(`${item.name || t('ui.noRecorded')}${quantityText}`)}</span>
+                    </div>`;
+                }).join('')}
+            </section>`);
+    }
+    if (day.anomalies?.length) {
+        sections.push(`
+            <section class="horae-calendar-detail-section anomaly">
+                <h4><i class="fa-solid fa-triangle-exclamation"></i>${escapeHtml(t('timeline.timeAnomalies'))}</h4>
+                ${day.anomalies.map(anomaly => `<div class="horae-calendar-record static">
+                    <span>${escapeHtml(t('status.timeAnomaly', { previous: anomaly.previous || '?', proposed: anomaly.proposed || '?' }))}</span>
+                </div>`).join('')}
+            </section>`);
+    }
+
+    detailEl.innerHTML = `
+        <div class="horae-calendar-detail-header">
+            <strong>${escapeHtml(day.displayDate || day.date)}</strong>
+            ${day.firstTime || day.lastTime ? `<span>${escapeHtml([day.firstTime, day.lastTime].filter(Boolean).join(' - '))}</span>` : ''}
+        </div>
+        ${sections.join('') || `<div class="horae-calendar-detail-empty">${escapeHtml(t('timeline.noDayRecords'))}</div>`}`;
+    detailEl.querySelectorAll('[data-calendar-message]').forEach(button => {
+        button.addEventListener('click', () => scrollToMessage(button.dataset.calendarMessage));
+    });
+}
+
+function selectCalendarDay(key, calendar = null) {
+    const data = calendar || horaeManager.getMemoryState().calendar;
+    selectedCalendarDayKey = key || '';
+    document.querySelectorAll('.horae-calendar-day, .horae-calendar-list-day').forEach(element => {
+        const selected = element.dataset.calendarDay === selectedCalendarDayKey;
+        element.classList.toggle('selected', selected);
+        element.setAttribute('aria-selected', String(selected));
+    });
+    updateCalendarDetail((data?.days || []).find(day => day.key === selectedCalendarDayKey));
+}
+
+function updateCalendarDisplay() {
+    const periodEl = document.getElementById('horae-calendar-period');
+    const weekdaysEl = document.getElementById('horae-calendar-weekdays');
+    const gridEl = document.getElementById('horae-calendar-grid');
+    const listEl = document.getElementById('horae-calendar-list');
+    const prevButton = document.getElementById('horae-calendar-prev');
+    const nextButton = document.getElementById('horae-calendar-next');
+    const todayButton = document.getElementById('horae-calendar-today');
+    if (!periodEl || !weekdaysEl || !gridEl || !listEl) return;
+
+    const setPeriodNavigationEnabled = (enabled) => {
+        if (prevButton) prevButton.disabled = !enabled;
+        if (nextButton) nextButton.disabled = !enabled;
+    };
+
+    const calendar = horaeManager.getMemoryState().calendar;
+    const days = calendar?.days || [];
+    if (!calendar?.clock?.rawDate || days.length === 0) {
+        periodEl.textContent = t('timeline.calendar');
+        weekdaysEl.innerHTML = '';
+        weekdaysEl.hidden = true;
+        setPeriodNavigationEnabled(false);
+        if (todayButton) todayButton.disabled = true;
+        gridEl.innerHTML = `<div class="horae-empty-state"><i class="fa-regular fa-calendar-xmark"></i><span>${escapeHtml(t('timeline.noCalendar'))}</span></div>`;
+        listEl.innerHTML = '';
+        updateCalendarDetail(null);
+        return;
+    }
+
+    if (todayButton) todayButton.disabled = false;
+
+    if (calendar.mode === 'list') {
+        periodEl.textContent = t('timeline.storyDates');
+        weekdaysEl.innerHTML = '';
+        weekdaysEl.hidden = true;
+        setPeriodNavigationEnabled(false);
+        gridEl.innerHTML = '';
+        listEl.innerHTML = days.map(day => `
+            <button type="button" class="horae-calendar-list-day${day.current ? ' current' : ''}${day.key === selectedCalendarDayKey ? ' selected' : ''}"
+                    data-calendar-day="${escapeHtml(day.key)}" aria-selected="${day.key === selectedCalendarDayKey}">
+                <span class="horae-calendar-list-date">${escapeHtml(day.displayDate || day.date)}</span>
+                <span class="horae-calendar-list-summary">${escapeHtml(day.events?.[0]?.summary || t('timeline.noDayRecords'))}</span>
+                ${renderCalendarMarkers(day)}
+            </button>`).join('');
+        if (!days.some(day => day.key === selectedCalendarDayKey)) {
+            selectedCalendarDayKey = (days.find(day => day.current) || days[days.length - 1]).key;
+        }
+    } else {
+        const cursor = getCalendarPeriod(calendar);
+        if (!cursor) {
+            weekdaysEl.innerHTML = '';
+            weekdaysEl.hidden = true;
+            setPeriodNavigationEnabled(false);
+            gridEl.innerHTML = `<div class="horae-empty-state"><i class="fa-regular fa-calendar-xmark"></i><span>${escapeHtml(t('timeline.noCalendar'))}</span></div>`;
+            listEl.innerHTML = '';
+            updateCalendarDetail(null);
+            return;
+        }
+        const custom = cursor.type === 'custom' ? calendar.customCalendar : null;
+        if (cursor.type === 'custom' && (!custom?.monthDays?.length || !custom?.monthNames?.length)) {
+            calendarCursor = null;
+            weekdaysEl.innerHTML = '';
+            weekdaysEl.hidden = true;
+            setPeriodNavigationEnabled(false);
+            gridEl.innerHTML = `<div class="horae-empty-state"><i class="fa-regular fa-calendar-xmark"></i><span>${escapeHtml(t('timeline.noCalendar'))}</span></div>`;
+            listEl.innerHTML = '';
+            updateCalendarDetail(null);
+            return;
+        }
+        setPeriodNavigationEnabled(true);
+        const monthCount = cursor.type === 'standard' ? 12 : custom.monthDays.length;
+        cursor.monthIndex = Math.max(0, Math.min(monthCount - 1, cursor.monthIndex));
+        const monthDays = cursor.type === 'standard'
+            ? new Date(cursor.year ?? 2000, cursor.monthIndex + 1, 0).getDate()
+            : Math.max(1, Number(custom.monthDays[cursor.monthIndex]) || 1);
+        const monthLabel = cursor.type === 'standard'
+            ? t('timeline.monthNumber', { month: cursor.monthIndex + 1 })
+            : custom.monthNames[cursor.monthIndex];
+        const yearLabel = cursor.year !== null ? t('timeline.yearNumber', { year: cursor.year }) : '';
+        periodEl.textContent = [yearLabel, monthLabel].filter(Boolean).join(' ');
+
+        const useWeekdays = cursor.type === 'standard';
+        weekdaysEl.innerHTML = useWeekdays
+            ? String(t('timeline.weekdayLabels')).split('|').map(label => `<span>${escapeHtml(label)}</span>`).join('')
+            : '';
+        weekdaysEl.hidden = !useWeekdays;
+        const firstOffset = useWeekdays
+            ? (() => { const date = new Date(0); date.setFullYear(cursor.year ?? 2000, cursor.monthIndex, 1); return date.getDay(); })()
+            : 0;
+        const periodDays = days.filter(day => calendarDayInPeriod(day, cursor));
+        const byNumber = new Map(periodDays.map(day => [Number(day.day), day]));
+        const cells = Array.from({ length: firstOffset }, () => '<span class="horae-calendar-day empty" aria-hidden="true"></span>');
+        for (let dayNumber = 1; dayNumber <= monthDays; dayNumber++) {
+            const day = byNumber.get(dayNumber);
+            const recordCount = getCalendarDayRecordCount(day);
+            cells.push(`
+                <button type="button" class="horae-calendar-day${day?.current ? ' current' : ''}${day?.key === selectedCalendarDayKey ? ' selected' : ''}${recordCount ? ' has-records' : ''}"
+                        ${day ? `data-calendar-day="${escapeHtml(day.key)}" aria-selected="${day.key === selectedCalendarDayKey}"` : 'disabled'}>
+                    <span class="horae-calendar-day-number">${dayNumber}</span>
+                    ${day ? renderCalendarMarkers(day) : '<span class="horae-calendar-day-markers"></span>'}
+                </button>`);
+        }
+        gridEl.innerHTML = cells.join('');
+        listEl.innerHTML = '';
+        const selectedInPeriod = periodDays.find(day => day.key === selectedCalendarDayKey);
+        if (!selectedInPeriod) {
+            selectedCalendarDayKey = (periodDays.find(day => day.current) || periodDays.find(day => getCalendarDayRecordCount(day) > 0))?.key || '';
+        }
+    }
+
+    document.querySelectorAll('[data-calendar-day]').forEach(button => {
+        button.addEventListener('click', () => selectCalendarDay(button.dataset.calendarDay, calendar));
+    });
+    selectCalendarDay(selectedCalendarDayKey, calendar);
+}
+
+function navigateCalendarPeriod(delta) {
+    const calendar = horaeManager.getMemoryState().calendar;
+    const cursor = getCalendarPeriod(calendar);
+    if (!cursor || calendar.mode !== 'grid') return;
+    const monthCount = cursor.type === 'standard' ? 12 : calendar.customCalendar?.monthDays?.length;
+    if (!monthCount) return;
+    cursor.monthIndex += delta;
+    if (cursor.monthIndex < 0) {
+        cursor.monthIndex = monthCount - 1;
+        if (cursor.year !== null) cursor.year--;
+    } else if (cursor.monthIndex >= monthCount) {
+        cursor.monthIndex = 0;
+        if (cursor.year !== null) cursor.year++;
+    }
+    selectedCalendarDayKey = '';
+    updateCalendarDisplay();
+}
+
+function returnToCurrentStoryDate() {
+    calendarCursor = null;
+    selectedCalendarDayKey = '';
+    updateCalendarDisplay();
+}
+
 /**
  * 更新状态页面显示
  */
 function updateStatusDisplay() {
     const state = horaeManager.getLatestState();
+    const memory = horaeManager.getMemoryState();
 
     // 更新时间显示（标准日历显示周几）
     const dateEl = document.getElementById('horae-current-date');
@@ -2178,6 +2534,32 @@ function updateStatusDisplay() {
         }
     }
     if (timeEl) timeEl.textContent = state.timestamp?.story_time || '--:--';
+
+    const confidenceEl = document.getElementById('horae-clock-confidence');
+    const agendaHealthEl = document.getElementById('horae-agenda-health');
+    const itemHealthEl = document.getElementById('horae-item-health');
+    const confidence = ['high', 'medium', 'low'].includes(memory.clock?.confidence) ? memory.clock.confidence : 'low';
+    if (confidenceEl) {
+        confidenceEl.className = `horae-health-metric confidence-${confidence}`;
+        confidenceEl.innerHTML = `<i class="fa-solid fa-clock"></i>${escapeHtml(t('status.clockConfidence'))}: ${escapeHtml(t(`status.confidence${confidence[0].toUpperCase()}${confidence.slice(1)}`))}`;
+    }
+    if (agendaHealthEl) {
+        const overdue = (memory.agenda?.active || []).filter(item => item.status === 'overdue').length;
+        agendaHealthEl.className = `horae-health-metric${overdue ? ' warning' : ''}`;
+        agendaHealthEl.innerHTML = `<i class="fa-solid fa-list-check"></i>${escapeHtml(t('status.activeAgenda'))}: ${memory.agenda?.active?.length || 0} · ${escapeHtml(t('status.overdueAgenda'))}: ${overdue}`;
+    }
+    if (itemHealthEl) {
+        itemHealthEl.className = 'horae-health-metric';
+        itemHealthEl.innerHTML = `<i class="fa-solid fa-box-open"></i>${escapeHtml(t('status.activeItems'))}: ${memory.items?.active?.length || 0} · ${escapeHtml(t('status.archivedItems'))}: ${memory.items?.archived?.length || 0}`;
+    }
+    const anomalyEl = document.getElementById('horae-clock-anomaly');
+    if (anomalyEl) {
+        const anomaly = memory.clock?.anomaly;
+        anomalyEl.hidden = !anomaly;
+        anomalyEl.innerHTML = anomaly
+            ? `<i class="fa-solid fa-triangle-exclamation"></i><span>${escapeHtml(t('status.timeAnomaly', { previous: anomaly.previous || '?', proposed: anomaly.proposed || '?' }))}</span>`
+            : '';
+    }
 
     // 更新地点显示
     const locationEl = document.getElementById('horae-current-location');
@@ -2201,8 +2583,8 @@ function updateStatusDisplay() {
         } else {
             costumesEl.innerHTML = entries.map(([char, costume]) => `
                 <div class="horae-costume-item">
-                    <span class="horae-costume-char">${char}</span>
-                    <span class="horae-costume-desc">${costume}</span>
+                    <span class="horae-costume-char">${escapeHtml(char)}</span>
+                    <span class="horae-costume-desc">${escapeHtml(costume)}</span>
                 </div>
             `).join('');
         }
@@ -2211,15 +2593,16 @@ function updateStatusDisplay() {
     // 更新物品快速列表
     const itemsEl = document.getElementById('horae-items-quick');
     if (itemsEl) {
-        const entries = Object.entries(state.items || {});
+        const entries = memory.items?.active || [];
         if (entries.length === 0) {
             itemsEl.innerHTML = `<div class="horae-empty-hint">${t('status.noItems')}</div>`;
         } else {
-            itemsEl.innerHTML = entries.map(([name, info]) => {
-                const icon = info.icon || '📦';
-                const holderStr = info.holder ? `<span class="holder">${info.holder}</span>` : '';
-                const locationStr = info.location ? `<span class="location">@ ${info.location}</span>` : '';
-                return `<div class="horae-item-tag">${icon} ${name} ${holderStr} ${locationStr}</div>`;
+            itemsEl.innerHTML = entries.map(item => {
+                const icon = item.icon || '📦';
+                const quantity = formatLifecycleQuantity(item);
+                const holderStr = item.holder ? `<span class="holder">${escapeHtml(item.holder)}</span>` : '';
+                const locationStr = item.location ? `<span class="location">@ ${escapeHtml(item.location)}</span>` : '';
+                return `<div class="horae-item-tag">${escapeHtml(icon)} ${escapeHtml(item.name)}${quantity ? ` × ${escapeHtml(quantity)}` : ''} ${holderStr} ${locationStr}</div>`;
             }).join('');
         }
     }
@@ -2923,23 +3306,31 @@ function updateAgendaDisplay() {
         return;
     }
 
-    listEl.innerHTML = agenda.map((item, index) => {
+    listEl.innerHTML = agenda.map((item) => {
+        const itemId = String(item.id || `${item._msgIndex || 0}:${item._index || 0}:${item.text}`);
         const sourceIcon = item.source === 'ai'
             ? `<i class="fa-solid fa-robot horae-agenda-source-ai" title="${t('badge.aiRecord')}"></i>`
             : `<i class="fa-solid fa-user horae-agenda-source-user" title="${t('badge.userAdded')}"></i>`;
-        const dateDisplay = item.date ? `<span class="horae-agenda-date"><i class="fa-regular fa-calendar"></i> ${escapeHtml(item.date)}</span>` : '';
+        const dateText = item.dueAt || item.date;
+        const dateDisplay = dateText ? `<span class="horae-agenda-date"><i class="fa-regular fa-calendar"></i> ${escapeHtml(dateText)}</span>` : '';
+        const statusKey = {
+            overdue: 'lifecycle.overdue',
+            in_progress: 'lifecycle.inProgress',
+            pending: 'lifecycle.pending',
+        }[item.status] || 'lifecycle.pending';
+        const statusBadge = `<span class="horae-lifecycle-badge ${escapeHtml(item.status)}">${escapeHtml(t(statusKey))}</span>`;
 
         // 多选模式：显示 checkbox
         const checkboxHtml = agendaMultiSelectMode
-            ? `<label class="horae-agenda-select-check"><input type="checkbox" ${selectedAgendaIndices.has(index) ? 'checked' : ''} data-agenda-select="${index}"></label>`
+            ? `<label class="horae-agenda-select-check"><input type="checkbox" ${selectedAgendaIds.has(itemId) ? 'checked' : ''} data-agenda-select="${escapeHtml(itemId)}"></label>`
             : '';
-        const selectedClass = agendaMultiSelectMode && selectedAgendaIndices.has(index) ? ' selected' : '';
+        const selectedClass = agendaMultiSelectMode && selectedAgendaIds.has(itemId) ? ' selected' : '';
 
         return `
-            <div class="horae-agenda-item${selectedClass}" data-agenda-idx="${index}">
+            <div class="horae-agenda-item status-${escapeHtml(item.status)}${selectedClass}" data-agenda-id="${escapeHtml(itemId)}">
                 ${checkboxHtml}
                 <div class="horae-agenda-body">
-                    <div class="horae-agenda-meta">${sourceIcon}${dateDisplay}</div>
+                    <div class="horae-agenda-meta">${sourceIcon}${statusBadge}${dateDisplay}</div>
                     <div class="horae-agenda-text">${escapeHtml(item.text)}</div>
                 </div>
             </div>
@@ -2949,25 +3340,25 @@ function updateAgendaDisplay() {
     const currentAgenda = agenda;
 
     listEl.querySelectorAll('.horae-agenda-item').forEach(el => {
-        const idx = parseInt(el.dataset.agendaIdx);
+        const itemId = el.dataset.agendaId;
+        const item = currentAgenda.find(entry => String(entry.id || `${entry._msgIndex || 0}:${entry._index || 0}:${entry.text}`) === itemId);
 
         if (agendaMultiSelectMode) {
             // 多选模式：点击切换选中
             el.addEventListener('click', (e) => {
                 e.stopPropagation();
-                toggleAgendaSelection(idx);
+                toggleAgendaSelection(itemId);
             });
         } else {
             // 普通模式：点击编辑，长按进入多选
             el.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const item = currentAgenda[idx];
                 if (item) openAgendaEditModal(item);
             });
 
             // 长按进入多选模式（仅绑定在 agenda item 上）
-            el.addEventListener('mousedown', (e) => startAgendaLongPress(e, idx));
-            el.addEventListener('touchstart', (e) => startAgendaLongPress(e, idx), { passive: true });
+            el.addEventListener('mousedown', (e) => startAgendaLongPress(e, itemId));
+            el.addEventListener('touchstart', (e) => startAgendaLongPress(e, itemId), { passive: true });
             el.addEventListener('mouseup', cancelAgendaLongPress);
             el.addEventListener('mouseleave', cancelAgendaLongPress);
             el.addEventListener('touchmove', cancelAgendaLongPress, { passive: true });
@@ -2979,10 +3370,10 @@ function updateAgendaDisplay() {
 
 // ---- 待办多选模式 ----
 
-function startAgendaLongPress(e, agendaIdx) {
+function startAgendaLongPress(e, agendaId) {
     if (agendaMultiSelectMode) return;
     agendaLongPressTimer = setTimeout(() => {
-        enterAgendaMultiSelect(agendaIdx);
+        enterAgendaMultiSelect(agendaId);
     }, 800);
 }
 
@@ -2993,11 +3384,11 @@ function cancelAgendaLongPress() {
     }
 }
 
-function enterAgendaMultiSelect(initialIdx) {
+function enterAgendaMultiSelect(initialId) {
     agendaMultiSelectMode = true;
-    selectedAgendaIndices.clear();
-    if (initialIdx !== undefined && initialIdx !== null) {
-        selectedAgendaIndices.add(initialIdx);
+    selectedAgendaIds.clear();
+    if (initialId) {
+        selectedAgendaIds.add(initialId);
     }
 
     const bar = document.getElementById('horae-agenda-multiselect-bar');
@@ -3014,7 +3405,7 @@ function enterAgendaMultiSelect(initialIdx) {
 
 function exitAgendaMultiSelect() {
     agendaMultiSelectMode = false;
-    selectedAgendaIndices.clear();
+    selectedAgendaIds.clear();
 
     const bar = document.getElementById('horae-agenda-multiselect-bar');
     if (bar) bar.style.display = 'none';
@@ -3026,19 +3417,20 @@ function exitAgendaMultiSelect() {
     updateAgendaDisplay();
 }
 
-function toggleAgendaSelection(idx) {
-    if (selectedAgendaIndices.has(idx)) {
-        selectedAgendaIndices.delete(idx);
+function toggleAgendaSelection(id) {
+    if (selectedAgendaIds.has(id)) {
+        selectedAgendaIds.delete(id);
     } else {
-        selectedAgendaIndices.add(idx);
+        selectedAgendaIds.add(id);
     }
 
     // 更新该条目的UI
-    const item = document.querySelector(`#horae-agenda-list .horae-agenda-item[data-agenda-idx="${idx}"]`);
+    const item = [...document.querySelectorAll('#horae-agenda-list .horae-agenda-item')]
+        .find(entry => entry.dataset.agendaId === id);
     if (item) {
         const cb = item.querySelector('input[type="checkbox"]');
-        if (cb) cb.checked = selectedAgendaIndices.has(idx);
-        item.classList.toggle('selected', selectedAgendaIndices.has(idx));
+        if (cb) cb.checked = selectedAgendaIds.has(id);
+        item.classList.toggle('selected', selectedAgendaIds.has(id));
     }
 
     updateAgendaSelectedCount();
@@ -3047,8 +3439,8 @@ function toggleAgendaSelection(idx) {
 function selectAllAgenda() {
     const items = document.querySelectorAll('#horae-agenda-list .horae-agenda-item');
     items.forEach(item => {
-        const idx = parseInt(item.dataset.agendaIdx);
-        if (!isNaN(idx)) selectedAgendaIndices.add(idx);
+        const id = item.dataset.agendaId;
+        if (id) selectedAgendaIds.add(id);
     });
     updateAgendaDisplay();
     updateAgendaSelectedCount();
@@ -3056,27 +3448,23 @@ function selectAllAgenda() {
 
 function updateAgendaSelectedCount() {
     const countEl = document.getElementById('horae-agenda-selected-count');
-    if (countEl) countEl.textContent = selectedAgendaIndices.size;
+    if (countEl) countEl.textContent = selectedAgendaIds.size;
 }
 
 async function deleteSelectedAgenda() {
-    if (selectedAgendaIndices.size === 0) {
+    if (selectedAgendaIds.size === 0) {
         showToast(t('toast.insufficientEvents'), 'warning');
         return;
     }
 
-    const confirmed = confirm(t('confirm.deleteAgenda', { n: selectedAgendaIndices.size }));
+    const confirmed = confirm(t('confirm.deleteAgenda', { n: selectedAgendaIds.size }));
     if (!confirmed) return;
 
-    // 获取当前完整的 agenda 列表，按索引倒序删除
+    // 按稳定 ID 归档，不修改历史楼层。
     const agenda = getAllAgenda();
-    const sortedIndices = Array.from(selectedAgendaIndices).sort((a, b) => b - a);
-
-    for (const idx of sortedIndices) {
-        const item = agenda[idx];
-        if (item) {
-            deleteAgendaItem(item);
-        }
+    for (const item of agenda) {
+        const id = String(item.id || `${item._msgIndex || 0}:${item._index || 0}:${item.text}`);
+        if (selectedAgendaIds.has(id)) deleteAgendaItem(item);
     }
 
     await getContext().saveChat();
@@ -3902,7 +4290,7 @@ async function deleteSelectedTimelineEvents() {
 function openAgendaEditModal(agendaItem = null) {
     const isEdit = agendaItem !== null;
     const currentText = isEdit ? (agendaItem.text || '') : '';
-    const currentDate = isEdit ? (agendaItem.date || '') : '';
+    const currentDate = isEdit ? (agendaItem.dueAt || agendaItem.date || '') : '';
     const title = isEdit ? t('ui.editAgenda') : t('ui.addAgenda');
 
     closeEditModal();
@@ -3920,7 +4308,7 @@ function openAgendaEditModal(agendaItem = null) {
                 </div>
                 <div class="horae-modal-body horae-edit-modal-body">
                     <div class="horae-edit-field">
-                        <label>${t('label.agendaDate')}</label>
+                        <label>${t('timeline.agendaDue')}</label>
                         <input type="text" id="agenda-edit-date" value="${escapeHtml(currentDate)}" placeholder="${t('placeholder.agendaDate')}">
                     </div>
                     <div class="horae-edit-field">
@@ -3964,31 +4352,13 @@ function openAgendaEditModal(agendaItem = null) {
         }
 
         if (isEdit) {
-            // 编辑现有项
-            const context = getContext();
-            if (agendaItem._store === 'user') {
-                const agenda = getUserAgenda();
-                const found = agenda.find(a => a.text === agendaItem.text);
-                if (found) {
-                    found.text = text;
-                    found.date = date;
-                }
-                setUserAgenda(agenda);
-            } else if (agendaItem._store === 'msg' && context?.chat) {
-                const msg = context.chat[agendaItem._msgIndex];
-                if (msg?.horae_meta?.agenda) {
-                    const found = msg.horae_meta.agenda.find(a => a.text === agendaItem.text);
-                    if (found) {
-                        found.text = text;
-                        found.date = date;
-                    }
-                    getContext().saveChat();
-                }
-            }
+            // 面板日期表示截止时间；保留原始 createdAt，避免编辑计划时改写其建立时间。
+            appendAgendaOverride(agendaItem, { text, dueAt: date || null });
+            getContext().saveChat();
         } else {
             // 新增
             const agenda = getUserAgenda();
-            agenda.push({ text, date, source: 'user', done: false, createdAt: Date.now() });
+            agenda.push({ text, date, dueAt: date, source: 'user', done: false, createdAt: Date.now() });
             setUserAgenda(agenda);
         }
 
@@ -4491,7 +4861,7 @@ function toggleNpcFavorite(npcName) {
  * 更新物品页面显示
  */
 function updateItemsDisplay() {
-    const state = horaeManager.getLatestState();
+    const memoryItems = horaeManager.getMemoryState().items.active;
     const listEl = document.getElementById('horae-items-full-list');
     const filterEl = document.getElementById('horae-items-filter');
     const holderFilterEl = document.getElementById('horae-items-holder-filter');
@@ -4508,39 +4878,39 @@ function updateItemsDisplay() {
     const filterValue = filterEl?.value || 'all';
     const holderFilter = holderFilterEl?.value || 'all';
     const searchQuery = (searchEl?.value || '').trim().toLowerCase();
-    let entries = Object.entries(state.items || {});
+    let entries = [...memoryItems];
 
     if (holderFilterEl) {
         const currentHolder = holderFilterEl.value;
         const holders = new Set();
-        entries.forEach(([name, info]) => {
+        entries.forEach(info => {
             if (info.holder) holders.add(info.holder);
         });
 
         // 保留当前选项，更新选项列表
         const holderOptions = [`<option value="all">${t('ui.allHolders')}</option>`];
-        holders.forEach(holder => {
-            holderOptions.push(`<option value="${holder}" ${holder === currentHolder ? 'selected' : ''}>${holder}</option>`);
+        [...holders].sort((a, b) => String(a).localeCompare(String(b))).forEach(holder => {
+            holderOptions.push(`<option value="${escapeHtml(holder)}" ${holder === currentHolder ? 'selected' : ''}>${escapeHtml(holder)}</option>`);
         });
         holderFilterEl.innerHTML = holderOptions.join('');
     }
 
     // 搜索物品 - 按关键字
     if (searchQuery) {
-        entries = entries.filter(([name, info]) => {
-            const searchTarget = `${name} ${info.icon || ''} ${info.description || ''} ${info.holder || ''} ${info.location || ''}`.toLowerCase();
+        entries = entries.filter(info => {
+            const searchTarget = `${info.name || ''} ${info.icon || ''} ${info.description || ''} ${info.holder || ''} ${info.location || ''}`.toLowerCase();
             return searchTarget.includes(searchQuery);
         });
     }
 
     // 筛选物品 - 按重要程度
     if (filterValue !== 'all') {
-        entries = entries.filter(([name, info]) => info.importance === filterValue);
+        entries = entries.filter(info => info.importance === filterValue);
     }
 
     // 筛选物品 - 按持有人
     if (holderFilter !== 'all') {
-        entries = entries.filter(([name, info]) => info.holder === holderFilter);
+        entries = entries.filter(info => info.holder === holderFilter);
     }
 
     if (entries.length === 0) {
@@ -4551,60 +4921,66 @@ function updateItemsDisplay() {
         listEl.innerHTML = `
             <div class="horae-empty-state">
                 <i class="fa-solid fa-box-open"></i>
-                <span>${emptyMsg}</span>
+                <span>${escapeHtml(emptyMsg)}</span>
             </div>
         `;
         return;
     }
 
-    listEl.innerHTML = entries.map(([name, info]) => {
+    listEl.innerHTML = entries.map(info => {
+        const name = info.name || info.displayName || '';
+        const itemId = String(info.id || info._id || '');
         const icon = info.icon || '📦';
         const importance = info.importance || '';
         const isCritical = importance === '!!' || importance === '关键' || importance === '關鍵' || importance === 'critical';
         const isImportant = importance === '!' || importance === '重要' || importance === 'important';
         const importanceClass = isCritical ? 'critical' : isImportant ? 'important' : 'normal';
         const importanceLabel = isCritical ? t('levels.critical') : isImportant ? t('levels.important') : '';
-        const importanceBadge = importanceLabel ? `<span class="horae-item-importance ${importanceClass}">${importanceLabel}</span>` : '';
+        const importanceBadge = importanceLabel ? `<span class="horae-item-importance ${importanceClass}">${escapeHtml(importanceLabel)}</span>` : '';
 
         // 修复显示格式：持有者 · 位置
         let positionStr = '';
         if (info.holder && info.location) {
-            positionStr = `<span class="holder">${info.holder}</span> · ${info.location}`;
+            positionStr = `<span class="holder">${escapeHtml(info.holder)}</span> · ${escapeHtml(info.location)}`;
         } else if (info.holder) {
-            positionStr = `<span class="holder">${info.holder}</span> ${t('ui.heldBy')}`;
+            positionStr = `<span class="holder">${escapeHtml(info.holder)}</span> ${escapeHtml(t('ui.heldBy'))}`;
         } else if (info.location) {
-            positionStr = t('ui.locatedAt', { location: info.location });
+            positionStr = escapeHtml(t('ui.locatedAt', { location: info.location }));
         } else {
-            positionStr = t('ui.locationUnknown');
+            positionStr = escapeHtml(t('ui.locationUnknown'));
         }
 
-        const isSelected = selectedItems.has(name);
+        const isSelected = selectedItems.has(itemId);
         const selectedClass = isSelected ? 'selected' : '';
         const checkboxDisplay = itemsMultiSelectMode ? 'flex' : 'none';
         const description = info.description || '';
-        const descHtml = description ? `<div class="horae-full-item-desc">${description}</div>` : '';
+        const descHtml = description ? `<div class="horae-full-item-desc">${escapeHtml(description)}</div>` : '';
         const isLocked = !!info._locked;
         const lockIcon = isLocked ? 'fa-lock' : 'fa-lock-open';
         const lockTitle = isLocked ? t('ui.locked') : t('ui.clickToLock');
+        const quantity = formatLifecycleQuantity(info);
+        const lifecycle = info.decayPolicy ? 'decaying' : (info.status || 'active');
+        const lifecycleKey = lifecycle === 'in_progress' ? 'inProgress' : lifecycle;
+        const lifecycleLabel = t(`lifecycle.${lifecycleKey}`);
 
         return `
-            <div class="horae-full-item horae-editable-item ${importanceClass} ${selectedClass}" data-item-name="${name}">
+            <div class="horae-full-item horae-editable-item ${importanceClass} ${selectedClass}" data-item-id="${escapeHtml(itemId)}" data-item-name="${escapeHtml(name)}">
                 <div class="horae-item-checkbox" style="display: ${checkboxDisplay}">
                     <input type="checkbox" ${isSelected ? 'checked' : ''}>
                 </div>
                 <div class="horae-full-item-icon horae-item-emoji">
-                    ${icon}
+                    ${escapeHtml(icon)}
                 </div>
                 <div class="horae-full-item-info">
-                    <div class="horae-full-item-name">${name} ${importanceBadge}</div>
+                    <div class="horae-full-item-name">${escapeHtml(name)}${quantity ? ` <span class="horae-item-quantity">${escapeHtml(quantity)}</span>` : ''} ${importanceBadge}<span class="horae-lifecycle-badge ${escapeHtml(lifecycle)}">${escapeHtml(lifecycleLabel)}</span></div>
                     <div class="horae-full-item-location">${positionStr}</div>
                     ${descHtml}
                 </div>
-                ${(settings.rpgMode && settings.sendRpgEquipment) ? `<button class="horae-item-equip-btn" data-item-name="${name}" title="${t('ui.equipToChar')}"><i class="fa-solid fa-shirt"></i></button>` : ''}
-                <button class="horae-item-lock-btn" data-item-name="${name}" title="${lockTitle}" style="opacity:${isLocked ? '1' : '0.35'}">
+                ${(settings.rpgMode && settings.sendRpgEquipment) ? `<button class="horae-item-equip-btn" data-item-id="${escapeHtml(itemId)}" title="${escapeHtml(t('ui.equipToChar'))}"><i class="fa-solid fa-shirt"></i></button>` : ''}
+                <button class="horae-item-lock-btn" data-item-id="${escapeHtml(itemId)}" title="${escapeHtml(lockTitle)}" style="opacity:${isLocked ? '1' : '0.35'}">
                     <i class="fa-solid ${lockIcon}"></i>
                 </button>
-                <button class="horae-item-edit-btn" data-edit-type="item" data-edit-name="${name}" title="${t('common.edit')}">
+                <button class="horae-item-edit-btn" data-edit-type="item" data-edit-id="${escapeHtml(itemId)}" title="${escapeHtml(t('common.edit'))}">
                     <i class="fa-solid fa-pen"></i>
                 </button>
             </div>
@@ -4629,10 +5005,11 @@ function bindEditButtons() {
             e.stopPropagation();
             const editType = btn.dataset.editType;
             const editName = btn.dataset.editName;
+            const editId = btn.dataset.editId;
             const messageId = btn.dataset.messageId;
 
             if (editType === 'item') {
-                openItemEditModal(editName);
+                openItemEditModal(editId);
             } else if (editType === 'npc') {
                 openNpcEditModal(editName);
             } else if (editType === 'event') {
@@ -4649,9 +5026,8 @@ function bindEditButtons() {
 /**
  * 打开物品编辑弹窗
  */
-function openItemEditModal(itemName) {
-    const state = horaeManager.getLatestState();
-    const item = state.items?.[itemName];
+function openItemEditModal(itemId) {
+    const item = getMemoryItemById(itemId);
     if (!item) {
         showToast(t('toast.itemNotFoundGeneric'), 'error');
         return;
@@ -4666,11 +5042,11 @@ function openItemEditModal(itemName) {
                 <div class="horae-modal-body horae-edit-modal-body">
                     <div class="horae-edit-field">
                         <label>${t('placeholder.itemName')}</label>
-                        <input type="text" id="edit-item-name" value="${itemName}" placeholder="${t('placeholder.itemName')}">
+                        <input type="text" id="edit-item-name" value="${escapeHtml(item.name || '')}" placeholder="${escapeHtml(t('placeholder.itemName'))}">
                     </div>
                     <div class="horae-edit-field">
                         <label>${t('label.icon')}</label>
-                        <input type="text" id="edit-item-icon" value="${item.icon || ''}" maxlength="2" placeholder="📦">
+                        <input type="text" id="edit-item-icon" value="${escapeHtml(item.icon || '')}" maxlength="2" placeholder="📦">
                     </div>
                     <div class="horae-edit-field">
                         <label>${t('label.importance')}</label>
@@ -4682,15 +5058,15 @@ function openItemEditModal(itemName) {
                     </div>
                     <div class="horae-edit-field">
                         <label>${t('label.description')}</label>
-                        <textarea id="edit-item-desc" placeholder="${t('placeholder.itemDesc')}">${item.description || ''}</textarea>
+                        <textarea id="edit-item-desc" placeholder="${escapeHtml(t('placeholder.itemDesc'))}">${escapeHtml(item.description || '')}</textarea>
                     </div>
                     <div class="horae-edit-field">
                         <label>${t('label.holder')}</label>
-                        <input type="text" id="edit-item-holder" value="${item.holder || ''}" placeholder="${t('placeholder.holderName')}">
+                        <input type="text" id="edit-item-holder" value="${escapeHtml(item.holder || '')}" placeholder="${escapeHtml(t('placeholder.holderName'))}">
                     </div>
                     <div class="horae-edit-field">
                         <label>${t('label.location')}</label>
-                        <input type="text" id="edit-item-location" value="${item.location || ''}" placeholder="${t('placeholder.locationName')}">
+                        <input type="text" id="edit-item-location" value="${escapeHtml(item.location || '')}" placeholder="${escapeHtml(t('placeholder.locationName'))}">
                     </div>
                 </div>
                 <div class="horae-modal-footer">
@@ -4718,6 +5094,7 @@ function openItemEditModal(itemName) {
         }
 
         const newData = {
+            name: newName,
             icon: document.getElementById('edit-item-icon').value || item.icon,
             importance: document.getElementById('edit-item-importance').value,
             description: document.getElementById('edit-item-desc').value,
@@ -4725,25 +5102,7 @@ function openItemEditModal(itemName) {
             location: document.getElementById('edit-item-location').value
         };
 
-        // 更新所有消息中的该物品（含数量后缀变体，如 sword(3)）
-        const chat = horaeManager.getChat();
-        const nameChanged = newName !== itemName;
-        const editBaseName = getItemBaseName(itemName).toLowerCase();
-
-        for (let i = 0; i < chat.length; i++) {
-            const meta = chat[i].horae_meta;
-            if (!meta?.items) continue;
-            const matchKey = Object.keys(meta.items).find(k =>
-                k === itemName || getItemBaseName(k).toLowerCase() === editBaseName
-            );
-            if (!matchKey) continue;
-            if (nameChanged) {
-                meta.items[newName] = { ...meta.items[matchKey], ...newData };
-                delete meta.items[matchKey];
-            } else {
-                Object.assign(meta.items[matchKey], newData);
-            }
-        }
+        appendItemOverride(item, newData);
 
         await getContext().saveChat();
         closeEditModal();
@@ -5907,8 +6266,8 @@ function renderCustomTablesList() {
  * HTML转义
  */
 function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;')
+    if (str === undefined || str === null) return '';
+    return String(str).replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
@@ -6600,13 +6959,13 @@ function bindItemsEvents() {
     const items = document.querySelectorAll('#horae-items-full-list .horae-full-item');
 
     items.forEach(item => {
-        const itemName = item.dataset.itemName;
-        if (!itemName) return;
+        const itemId = item.dataset.itemId;
+        if (!itemId) return;
 
         // 多选模式下点击切换选中
         item.addEventListener('click', () => {
             if (itemsMultiSelectMode) {
-                toggleItemSelection(itemName);
+                toggleItemSelection(itemId);
             }
         });
     });
@@ -6614,38 +6973,23 @@ function bindItemsEvents() {
     document.querySelectorAll('.horae-item-equip-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            _openEquipItemDialog(btn.dataset.itemName);
+            _openEquipItemDialog(btn.dataset.itemId);
         });
     });
 
     document.querySelectorAll('.horae-item-lock-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            const name = btn.dataset.itemName;
-            if (!name) return;
-            const state = horaeManager.getLatestState();
-            const itemInfo = state.items?.[name];
+            const itemInfo = getMemoryItemById(btn.dataset.itemId);
             if (!itemInfo) return;
-            const chat = horaeManager.getChat();
-            for (let i = chat.length - 1; i >= 0; i--) {
-                const meta = chat[i]?.horae_meta;
-                if (!meta?.items) continue;
-                const key = Object.keys(meta.items).find(k => k === name || k.replace(/^[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u, '').trim() === name);
-                if (key) {
-                    meta.items[key]._locked = !meta.items[key]._locked;
-                    getContext().saveChat();
-                    updateItemsDisplay();
-                    showToast(meta.items[key]._locked ? t('toast.itemLocked', { name }) : t('toast.itemUnlocked', { name }), meta.items[key]._locked ? 'success' : 'info');
-                    return;
-                }
-            }
-            const first = chat[0];
-            if (!first.horae_meta) first.horae_meta = createEmptyMeta();
-            if (!first.horae_meta.items) first.horae_meta.items = {};
-            first.horae_meta.items[name] = { ...itemInfo, _locked: true };
+            const locked = !itemInfo._locked;
+            appendItemOverride(itemInfo, { _locked: locked });
             getContext().saveChat();
             updateItemsDisplay();
-            showToast(t('toast.itemLocked', { name }), 'success');
+            showToast(
+                locked ? t('toast.itemLocked', { name: itemInfo.name }) : t('toast.itemUnlocked', { name: itemInfo.name }),
+                locked ? 'success' : 'info',
+            );
         });
     });
 }
@@ -6656,19 +7000,19 @@ function bindItemsEvents() {
 
 /**
  * 从物品栏穿戴到装备栏
- * @param {string} itemName 物品名
+ * @param {string} itemId   物品稳定 ID
  * @param {string} owner    角色名
  * @param {string} slotName 格位名
  * @param {object} [replacedItem] 被替换的旧装备（自动归还物品栏）
  */
-function _equipItemToChar(itemName, owner, slotName, replacedItem) {
+function _equipItemToChar(itemId, owner, slotName, replacedItem) {
     const chat = horaeManager.getChat();
     if (!chat?.length) return;
     const first = chat[0];
     if (!first.horae_meta) first.horae_meta = createEmptyMeta();
-    const state = horaeManager.getLatestState();
-    const itemInfo = state.items?.[itemName];
-    if (!itemInfo) { showToast(t('toast.itemNotFound', { name: itemName }), 'warning'); return; }
+    const itemInfo = getMemoryItemById(itemId);
+    if (!itemInfo) { showToast(t('toast.itemNotFoundGeneric'), 'warning'); return; }
+    const itemName = itemInfo.name;
 
     if (!first.horae_meta.rpg) first.horae_meta.rpg = {};
     const rpg = first.horae_meta.rpg;
@@ -6676,7 +7020,13 @@ function _equipItemToChar(itemName, owner, slotName, replacedItem) {
 
     // 被替换的旧装备归还物品栏（在重建数组前执行）
     if (replacedItem) {
-        _unequipToItems(owner, slotName, replacedItem.name, true);
+        _unequipToItems(
+            owner,
+            slotName,
+            replacedItem.name,
+            true,
+            replacedItem._itemMeta?.id || replacedItem._itemMeta?._id || '',
+        );
     }
 
     // 确保目标数组存在（unequip 可能删除了空数组）
@@ -6688,21 +7038,23 @@ function _equipItemToChar(itemName, owner, slotName, replacedItem) {
         name: itemName,
         attrs: {},
         _itemMeta: {
+            ...itemInfo,
+            id: itemInfo.id || itemInfo._id || itemId,
+            _id: itemInfo._id || itemInfo.id || itemId,
             icon: itemInfo.icon || '',
             description: itemInfo.description || '',
             importance: itemInfo.importance || '',
-            _id: itemInfo._id || '',
             _locked: itemInfo._locked || false,
         },
     };
     // 已有装备属性（从 eqAttrMap 等来源）
-    const existingEqData = _findExistingEquipAttrs(itemName);
+    const existingEqData = _findExistingEquipAttrs(itemName, itemInfo.id || itemInfo._id || itemId);
     if (existingEqData) eqEntry.attrs = { ...existingEqData };
 
     rpg.equipment[owner][slotName].push(eqEntry);
 
     // 从物品栏中移除
-    _removeItemFromState(itemName);
+    archiveItem(itemInfo);
 
     getContext().saveChat();
 }
@@ -6710,14 +7062,17 @@ function _equipItemToChar(itemName, owner, slotName, replacedItem) {
 /**
  * 脱下装备归还物品栏
  */
-function _unequipToItems(owner, slotName, equipName, skipSave) {
+function _unequipToItems(owner, slotName, equipName, skipSave, equipId = '') {
     const chat = horaeManager.getChat();
     if (!chat?.length) return;
     const first = chat[0];
     if (!first.horae_meta?.rpg?.equipment?.[owner]?.[slotName]) return;
 
     const slotArr = first.horae_meta.rpg.equipment[owner][slotName];
-    const idx = slotArr.findIndex(e => e.name === equipName);
+    const idx = slotArr.findIndex(entry => {
+        const id = entry._itemMeta?.id || entry._itemMeta?._id || '';
+        return equipId ? String(id) === String(equipId) : entry.name === equipName;
+    });
     if (idx < 0) return;
     const removed = slotArr.splice(idx, 1)[0];
 
@@ -6725,51 +7080,53 @@ function _unequipToItems(owner, slotName, equipName, skipSave) {
     if (!slotArr.length) delete first.horae_meta.rpg.equipment[owner][slotName];
     if (first.horae_meta.rpg.equipment[owner] && !Object.keys(first.horae_meta.rpg.equipment[owner]).length) delete first.horae_meta.rpg.equipment[owner];
 
-    // 归还到物品栏
-    if (!first.horae_meta.items) first.horae_meta.items = {};
     const meta = removed._itemMeta || {};
-    first.horae_meta.items[equipName] = {
-        icon: meta.icon || '📦',
-        description: meta.description || '',
-        importance: meta.importance || '',
-        holder: owner,
-        location: '',
-        _id: meta._id || '',
-        _locked: meta._locked || false,
-    };
-    // 恢复装备属性到描述
+    let description = meta.description || '';
     if (removed.attrs && Object.keys(removed.attrs).length > 0) {
         const attrStr = Object.entries(removed.attrs).map(([k, v]) => `${k}${v >= 0 ? '+' : ''}${v}`).join(', ');
-        const desc = first.horae_meta.items[equipName].description;
-        if (!desc.includes(attrStr)) {
-            first.horae_meta.items[equipName].description = desc ? `${desc} (${attrStr})` : attrStr;
-        }
+        if (!description.includes(attrStr)) description = description ? `${description} (${attrStr})` : attrStr;
+    }
+
+    const stableId = meta.id || meta._id || equipId;
+    if (stableId) {
+        restoreArchivedItem({ ...meta, id: stableId, _id: stableId, name: equipName }, {
+            name: equipName,
+            holder: owner,
+            location: '',
+            description,
+        });
+    } else {
+        // 旧版或手动装备没有来源 ID，保留为兼容快照。
+        if (!first.horae_meta.items) first.horae_meta.items = {};
+        first.horae_meta.items[equipName] = {
+            icon: meta.icon || '📦',
+            description,
+            importance: meta.importance || '',
+            holder: owner,
+            location: '',
+            _locked: meta._locked || false,
+        };
     }
 
     if (!skipSave) getContext().saveChat();
 }
 
-function _removeItemFromState(itemName) {
-    const chat = horaeManager.getChat();
-    if (!chat?.length) return;
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const meta = chat[i]?.horae_meta;
-        if (meta?.items?.[itemName]) {
-            delete meta.items[itemName];
-            return;
-        }
-    }
-}
-
-function _findExistingEquipAttrs(itemName) {
+function _findExistingEquipAttrs(itemName, itemId = '') {
     try {
         const rpg = horaeManager.getRpgStateAt(0);
+        const targetId = String(itemId || '').replace(/^#/, '');
+        let legacyMatch = null;
         for (const [, slots] of Object.entries(rpg.equipment || {})) {
             for (const [, items] of Object.entries(slots)) {
-                const found = items.find(e => e.name === itemName);
-                if (found?.attrs && Object.keys(found.attrs).length > 0) return { ...found.attrs };
+                for (const entry of items) {
+                    if (!entry?.attrs || Object.keys(entry.attrs).length === 0) continue;
+                    const entryId = String(entry.itemId || entry?._itemMeta?.id || entry?._itemMeta?._id || '').replace(/^#/, '');
+                    if (targetId && entryId === targetId) return { ...entry.attrs };
+                    if (entry.name === itemName && (!targetId || !entryId) && !legacyMatch) legacyMatch = entry;
+                }
             }
         }
+        if (legacyMatch) return { ...legacyMatch.attrs };
     } catch (_) { /* ignore */ }
     return null;
 }
@@ -6777,7 +7134,7 @@ function _findExistingEquipAttrs(itemName) {
 /**
  * 打开装备穿戴对话框：选角色 → 选格位 → 穿戴
  */
-function _openEquipItemDialog(itemName) {
+function _openEquipItemDialog(itemId) {
     const cfgMap = _getEqConfigMap();
     const perChar = cfgMap.perChar || {};
     const candidates = Object.entries(perChar).filter(([, cfg]) => cfg.slots?.length > 0);
@@ -6785,9 +7142,9 @@ function _openEquipItemDialog(itemName) {
         showToast(t('toast.noEquipChars'), 'warning');
         return;
     }
-    const state = horaeManager.getLatestState();
-    const itemInfo = state.items?.[itemName];
+    const itemInfo = getMemoryItemById(itemId);
     if (!itemInfo) return;
+    const itemName = itemInfo.name;
 
     const modal = document.createElement('div');
     modal.className = 'horae-modal';
@@ -6862,7 +7219,7 @@ function _openEquipItemDialog(itemName) {
         const existing = eqValues[owner]?.[slotName] || [];
         const replaced = existing.length >= max ? existing[0] : null;
 
-        _equipItemToChar(itemName, owner, slotName, replaced);
+        _equipItemToChar(itemId, owner, slotName, replaced);
         modal.remove();
         updateItemsDisplay();
         renderEquipmentValues();
@@ -6923,19 +7280,20 @@ function exitMultiSelectMode() {
 /**
  * 切换物品选中状态
  */
-function toggleItemSelection(itemName) {
-    if (selectedItems.has(itemName)) {
-        selectedItems.delete(itemName);
+function toggleItemSelection(itemId) {
+    if (selectedItems.has(itemId)) {
+        selectedItems.delete(itemId);
     } else {
-        selectedItems.add(itemName);
+        selectedItems.add(itemId);
     }
 
     // 更新UI
-    const item = document.querySelector(`#horae-items-full-list .horae-full-item[data-item-name="${itemName}"]`);
+    const item = [...document.querySelectorAll('#horae-items-full-list .horae-full-item')]
+        .find(element => element.dataset.itemId === itemId);
     if (item) {
         const checkbox = item.querySelector('input[type="checkbox"]');
-        if (checkbox) checkbox.checked = selectedItems.has(itemName);
-        item.classList.toggle('selected', selectedItems.has(itemName));
+        if (checkbox) checkbox.checked = selectedItems.has(itemId);
+        item.classList.toggle('selected', selectedItems.has(itemId));
     }
 
     updateSelectedCount();
@@ -6947,8 +7305,8 @@ function toggleItemSelection(itemName) {
 function selectAllItems() {
     const items = document.querySelectorAll('#horae-items-full-list .horae-full-item');
     items.forEach(item => {
-        const name = item.dataset.itemName;
-        if (name) selectedItems.add(name);
+        const itemId = item.dataset.itemId;
+        if (itemId) selectedItems.add(itemId);
     });
     updateItemsDisplay();
     updateSelectedCount();
@@ -6975,22 +7333,11 @@ async function deleteSelectedItems() {
     const confirmed = confirm(t('confirm.deleteTimeline', { n: selectedItems.size }));
     if (!confirmed) return;
 
-    // 从所有消息的 meta 中删除这些物品
-    const chat = horaeManager.getChat();
-    const itemsToDelete = Array.from(selectedItems);
-
-    for (let i = 0; i < chat.length; i++) {
-        const meta = chat[i].horae_meta;
-        if (meta && meta.items) {
-            let changed = false;
-            for (const itemName of itemsToDelete) {
-                if (meta.items[itemName]) {
-                    delete meta.items[itemName];
-                    changed = true;
-                }
-            }
-            if (changed) injectHoraeTagToMessage(i, meta);
-        }
+    const itemsById = new Map(horaeManager.getMemoryState().items.active
+        .map(item => [String(item.id || item._id || ''), item]));
+    for (const itemId of selectedItems) {
+        const item = itemsById.get(String(itemId));
+        if (item) archiveItem(item);
     }
 
     // 保存更改
@@ -8415,12 +8762,12 @@ function renderEquipmentValues() {
                 for (const item of items) {
                     const attrStr = Object.entries(item.attrs || {}).map(([k, v]) => `<span class="horae-rpg-eq-attr">${escapeHtml(k)} ${v >= 0 ? '+' : ''}${v}</span>`).join(' ');
                     const meta = item._itemMeta || {};
-                    const iconHtml = meta.icon ? `<span class="horae-rpg-eq-item-icon">${meta.icon}</span>` : '';
+                    const iconHtml = meta.icon ? `<span class="horae-rpg-eq-item-icon">${escapeHtml(meta.icon)}</span>` : '';
                     const descHtml = meta.description ? `<div class="horae-rpg-eq-item-desc">${escapeHtml(meta.description)}</div>` : '';
                     itemsHtml += `<div class="horae-rpg-eq-item">
                         <div class="horae-rpg-eq-item-header">
                             ${iconHtml}<span class="horae-rpg-eq-item-name">${escapeHtml(item.name)}</span> ${attrStr}
-                            <button class="horae-rpg-eq-item-del" data-owner="${escapeHtml(owner)}" data-slot="${escapeHtml(slot.name)}" data-item="${escapeHtml(item.name)}" title="${t('tooltip.unequipReturn')}"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
+                            <button class="horae-rpg-eq-item-del" data-owner="${escapeHtml(owner)}" data-slot="${escapeHtml(slot.name)}" data-item="${escapeHtml(item.name)}" data-item-id="${escapeHtml(meta.id || meta._id || '')}" title="${t('tooltip.unequipReturn')}"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
                         </div>
                         ${descHtml}
                     </div>`;
@@ -8447,10 +8794,10 @@ function renderEquipmentValues() {
                 itemsHtml += `<div class="horae-rpg-eq-item horae-rpg-eq-item-inactive" title="${escapeHtml(title)}">
                     <div class="horae-rpg-eq-item-header">
                         <span class="horae-rpg-eq-inactive-badge"><i class="fa-solid fa-triangle-exclamation"></i> ${t('ui.inactive')}</span>
-                        ${meta.icon ? `<span class="horae-rpg-eq-item-icon">${meta.icon}</span>` : ''}
+                        ${meta.icon ? `<span class="horae-rpg-eq-item-icon">${escapeHtml(meta.icon)}</span>` : ''}
                         <span class="horae-rpg-eq-item-name">${escapeHtml(item.name)}</span> ${attrStr}
                         <span class="horae-rpg-eq-item-slot">${escapeHtml(slotName)}</span>
-                        <button class="horae-rpg-eq-item-del" data-owner="${escapeHtml(owner)}" data-slot="${escapeHtml(slotName)}" data-item="${escapeHtml(item.name)}" title="${t('tooltip.unequipReturn')}"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
+                        <button class="horae-rpg-eq-item-del" data-owner="${escapeHtml(owner)}" data-slot="${escapeHtml(slotName)}" data-item="${escapeHtml(item.name)}" data-item-id="${escapeHtml(meta.id || meta._id || '')}" title="${t('tooltip.unequipReturn')}"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
                     </div>
                     ${descHtml}
                     <div class="horae-rpg-eq-inactive-reason">${escapeHtml(title)}</div>
@@ -8527,8 +8874,10 @@ function _openAddEquipDialog(owner) {
         const maxCount = slotCfg?.maxCount ?? 1;
         if (eqValues[owner][slotName].length >= maxCount) {
             if (!confirm(t('confirm.importEquipment'))) return;
-            const bumped = eqValues[owner][slotName].shift();
-            if (bumped) _unequipToItems(owner, slotName, bumped.name, true);
+            const bumped = eqValues[owner][slotName][0];
+            if (bumped) _unequipToItems(owner, slotName, bumped.name, true, bumped._itemMeta?.id || bumped._itemMeta?._id || '');
+            if (!eqValues[owner]) eqValues[owner] = {};
+            if (!eqValues[owner][slotName]) eqValues[owner][slotName] = [];
         }
         eqValues[owner][slotName].push({ name: itemName, attrs, _itemMeta: {} });
         _saveEqData();
@@ -8708,7 +9057,7 @@ function _bindEquipmentEvents() {
         const owner = this.dataset.owner;
         const slotName = this.dataset.slot;
         const itemName = this.dataset.item;
-        _unequipToItems(owner, slotName, itemName, false);
+        _unequipToItems(owner, slotName, itemName, false, this.dataset.itemId || '');
         renderEquipmentValues();
         _bindEquipmentEvents();
         updateItemsDisplay();
@@ -9852,7 +10201,7 @@ function refreshAllDisplays() {
     enforceHiddenState();
     updateStatusDisplay();
     updateAgendaDisplay();
-    updateTimelineDisplay();
+    setTimelineView(timelineViewMode);
     updateCharactersDisplay();
     updateItemsDisplay();
     updateLocationMemoryDisplay();
@@ -9863,7 +10212,8 @@ function refreshAllDisplays() {
 
 /** chat[0] 上的全局键——无法由 rebuild 系列函数重建，需在 meta 重置时保留 */
 const _GLOBAL_META_KEYS = [
-    'autoSummaries', '_deletedNpcs', '_deletedAgendaTexts',
+    'autoSummaries', '_deletedNpcs', '_deletedAgendaTexts', '_deletedAgendaIds', '_agendaOverrides',
+    '_deletedItemIds', '_itemOverrides',
     'locationMemory', 'relationships', 'rpg',
     '_rpgConfigs', '_pendingScanReview', '_userAddedNpcs',
 ];
@@ -10491,7 +10841,9 @@ function updateTokenCounter() {
  * 滚动到指定消息（支持折叠/懒加载的消息展开跳转）
  */
 async function scrollToMessage(messageId) {
-    let messageEl = document.querySelector(`.mes[mesid="${messageId}"]`);
+    const normalizedId = Number.parseInt(messageId, 10);
+    if (!Number.isFinite(normalizedId) || normalizedId < 0) return;
+    let messageEl = document.querySelector(`.mes[mesid="${normalizedId}"]`);
     if (messageEl) {
         messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         messageEl.classList.add('horae-highlight');
@@ -10499,19 +10851,19 @@ async function scrollToMessage(messageId) {
         return;
     }
     // 消息不在 DOM 中（被酒馆折叠/懒加载），提示用户展开
-    if (!confirm(t('confirm.jumpToFarMessage', { id: messageId }))) return;
+    if (!confirm(t('confirm.jumpToFarMessage', { id: normalizedId }))) return;
     try {
         const slashModule = await import('/scripts/slash-commands.js');
         const exec = slashModule.executeSlashCommandsWithOptions;
-        await exec(`/go ${messageId}`);
+        await exec(`/go ${normalizedId}`);
         await new Promise(r => setTimeout(r, 300));
-        messageEl = document.querySelector(`.mes[mesid="${messageId}"]`);
+        messageEl = document.querySelector(`.mes[mesid="${normalizedId}"]`);
         if (messageEl) {
             messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
             messageEl.classList.add('horae-highlight');
             setTimeout(() => messageEl.classList.remove('horae-highlight'), 2000);
         } else {
-            showToast(t('toast.jumpFailed', { id: messageId }), 'warning');
+            showToast(t('toast.jumpFailed', { id: normalizedId }), 'warning');
         }
     } catch (err) {
         console.warn('[Horae] 跳转失败:', err);
@@ -12613,10 +12965,31 @@ async function savePanelData(panelEl, messageId) {
 function buildHoraeTagFromMeta(meta) {
     const lines = [];
 
+    const protocolValue = value => String(value ?? '')
+        .replace(/[|\r\n]+/g, ' / ')
+        .trim();
+    const appendLifecycleLine = (prefix, record, fields) => {
+        const parts = [];
+        for (const field of fields) {
+            const value = record?.[field];
+            if (value === undefined || value === null || value === '') continue;
+            const serialized = typeof value === 'object' ? JSON.stringify(value) : protocolValue(value);
+            parts.push(`${field}=${serialized}`);
+        }
+        if (parts.length > 0) lines.push(`${prefix}:${parts.join('|')}`);
+    };
+
     if (meta.timestamp?.story_date) {
         let timeLine = `time:${meta.timestamp.story_date}`;
         if (meta.timestamp.story_time) timeLine += ` ${meta.timestamp.story_time}`;
         lines.push(timeLine);
+    }
+
+    if (meta.storyClock?.timeline || meta.storyClock?.confidence || meta.storyClock?.source) {
+        const parts = [protocolValue(meta.storyClock.timeline || meta.storyClock.mode || 'main')];
+        if (meta.storyClock.confidence) parts.push(`confidence=${protocolValue(meta.storyClock.confidence)}`);
+        if (meta.storyClock.source) parts.push(`source=${protocolValue(meta.storyClock.source)}`);
+        lines.push(`time_context:${parts.join('|')}`);
     }
 
     if (meta.scene?.location) {
@@ -12649,6 +13022,19 @@ function buildHoraeTagFromMeta(meta) {
             const loc = info.location ? `@${info.location}` : '';
             lines.push(`item${imp}:${icon}${name}${desc}=${holder}${loc}`);
         }
+    }
+
+    for (const record of (meta.itemLifecycle || [])) {
+        const action = String(record.action || record.op || 'update').toLowerCase();
+        const prefix = action === 'add' || action === 'create' ? 'item+'
+            : action === 'transfer' ? 'item>'
+                : action === 'close' || action === 'remove' ? 'itemx' : 'item~';
+        appendLifecycleLine(prefix, record, [
+            'id', 'targetId', 'name', 'qty', 'quantity', 'delta', 'unit', 'status',
+            'icon', 'holder', 'location', 'description', 'kind', 'importance',
+            'acquiredAt', 'lastChangedAt', 'lastConfirmedAt', 'expiresAt',
+            'decayPolicy', '_locked', 'reason', 'evidence',
+        ]);
     }
 
     // deleted items
@@ -12705,6 +13091,18 @@ function buildHoraeTagFromMeta(meta) {
                 lines.push(`agenda:${datePart}${item.text}`);
             }
         }
+    }
+
+    for (const record of (meta.agendaLifecycle || [])) {
+        const action = String(record.action || record.op || 'update').toLowerCase();
+        const prefix = action === 'add' || action === 'create' ? 'agenda+'
+            : action === 'close' || action === 'remove' ? 'agenda!' : 'agenda~';
+        appendLifecycleLine(prefix, record, [
+            'id', 'targetId', 'text', 'title', 'status', 'createdAt', 'dueAt',
+            'startAt', 'endAt', 'expiresAt', 'location', 'priority', 'recurrence',
+            'participants', 'completionEvidence', 'supersedes', 'lastChangedAt',
+            'reason', 'evidence',
+        ]);
     }
 
     if (meta.deletedAgenda?.length > 0) {
@@ -12946,7 +13344,7 @@ function initTabs() {
                 break;
             case 'timeline':
                 updateAgendaDisplay();
-                updateTimelineDisplay();
+                setTimelineView(timelineViewMode);
                 break;
             case 'characters':
                 updateCharactersDisplay();
@@ -12976,6 +13374,27 @@ function initTabs() {
  * 初始化设置页事件
  */
 function initSettingsEvents() {
+    $('[data-timeline-view]').off('click.horaeCalendar').on('click.horaeCalendar', function () {
+        setTimelineView(this.dataset.timelineView);
+    });
+    $('[data-timeline-view]').off('keydown.horaeCalendar').on('keydown.horaeCalendar', function (event) {
+        const tabs = [...document.querySelectorAll('[data-timeline-view]')];
+        if (!tabs.length) return;
+        const currentIndex = tabs.indexOf(this);
+        let nextIndex = currentIndex;
+        if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+        else if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+        else if (event.key === 'Home') nextIndex = 0;
+        else if (event.key === 'End') nextIndex = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        setTimelineView(tabs[nextIndex].dataset.timelineView);
+        tabs[nextIndex].focus();
+    });
+    $('#horae-calendar-prev').off('click.horaeCalendar').on('click.horaeCalendar', () => navigateCalendarPeriod(-1));
+    $('#horae-calendar-next').off('click.horaeCalendar').on('click.horaeCalendar', () => navigateCalendarPeriod(1));
+    $('#horae-calendar-today').off('click.horaeCalendar').on('click.horaeCalendar', returnToCurrentStoryDate);
+
     $('#horae-btn-restart-tutorial').on('click', () => startTutorial());
     $('#horae-btn-restore-extsettings').on('click', () => {
         const raw = extension_settings[EXTENSION_NAME];
@@ -13987,6 +14406,13 @@ function initSettingsEvents() {
         updateTokenCounter();
     });
 
+    $('#horae-setting-send-same-day-memory').on('change', function () {
+        settings.sendSameDayMemory = this.checked;
+        saveSettings();
+        horaeManager.init(getContext(), settings);
+        updateTokenCounter();
+    });
+
     $('#horae-setting-context-depth').on('change', function () {
         const val = parseInt(this.value, 10);
         settings.contextDepth = Number.isNaN(val) ? 15 : Math.max(0, val);
@@ -13996,8 +14422,8 @@ function initSettingsEvents() {
         updateTokenCounter();
     });
 
-    $('#horae-setting-custom-cal-enabled').on('change', _applyCustomCalendarFromUI);
-    $('#horae-setting-custom-cal-apply').on('click', _applyCustomCalendarFromUI);
+    $('#horae-setting-custom-cal-enabled').off('change.horaeCalendar').on('change.horaeCalendar', _applyCustomCalendarFromUI);
+    $('#horae-setting-custom-cal-apply').off('click.horaeCalendar').on('click.horaeCalendar', _applyCustomCalendarFromUI);
 
     $('#horae-setting-send-characters').on('change', function () {
         settings.sendCharacters = this.checked;
@@ -14022,6 +14448,13 @@ function initSettingsEvents() {
 
     $('#horae-setting-send-items').on('change', function () {
         settings.sendItems = this.checked;
+        saveSettings();
+        horaeManager.init(getContext(), settings);
+        updateTokenCounter();
+    });
+
+    $('#horae-setting-send-agenda').on('change', function () {
+        settings.sendAgenda = this.checked;
         saveSettings();
         horaeManager.init(getContext(), settings);
         updateTokenCounter();
@@ -15818,12 +16251,14 @@ function syncSettingsToUI() {
     $('#horae-setting-injection-position').val(settings.injectionPosition);
     $('#horae-setting-timeline-injection-mode').val(settings.timelineInjectionMode === 'separate' ? 'separate' : 'inline');
     $('#horae-setting-send-timeline').prop('checked', settings.sendTimeline);
+    $('#horae-setting-send-same-day-memory').prop('checked', settings.sendSameDayMemory !== false);
     $('#horae-setting-context-depth').val(Number.isFinite(parseInt(settings.contextDepth, 10)) ? Math.max(0, parseInt(settings.contextDepth, 10)) : 15);
     _syncCustomCalendarToUI();
     $('#horae-setting-send-characters').prop('checked', settings.sendCharacters);
     $('#horae-setting-send-character-affection').prop('checked', settings.sendCharacterAffection !== false);
     $('#horae-setting-send-main-character-personality').prop('checked', settings.sendMainCharacterPersonality !== false);
     $('#horae-setting-send-items').prop('checked', settings.sendItems);
+    $('#horae-setting-send-agenda').prop('checked', settings.sendAgenda !== false);
 
     applyTopIconVisibility();
 
@@ -18390,21 +18825,25 @@ async function executeBatchScan(batches, options = {}) {
     // 用于真正中止HTTP请求的AbortController（fetch层面）
     const fetchAbort = new AbortController();
     const _origFetch = window.fetch;
-    window.fetch = function (input, init = {}) {
-        if (!cancelled) {
-            const ourSignal = fetchAbort.signal;
-            if (init.signal && typeof AbortSignal.any === 'function') {
-                init.signal = AbortSignal.any([init.signal, ourSignal]);
-            } else {
-                init.signal = ourSignal;
-            }
-        }
-        return _origFetch.call(this, input, init);
-    };
+    const scanResults = [];
+    let overlay = null;
 
-    const overlay = document.createElement('div');
-    overlay.className = 'horae-progress-overlay' + (isLightMode() ? ' horae-light' : '');
-    overlay.innerHTML = `
+    try {
+        window.fetch = function (input, init = {}) {
+            if (!cancelled) {
+                const ourSignal = fetchAbort.signal;
+                if (init.signal && typeof AbortSignal.any === 'function') {
+                    init.signal = AbortSignal.any([init.signal, ourSignal]);
+                } else {
+                    init.signal = ourSignal;
+                }
+            }
+            return _origFetch.call(this, input, init);
+        };
+
+        overlay = document.createElement('div');
+        overlay.className = 'horae-progress-overlay' + (isLightMode() ? ' horae-light' : '');
+        overlay.innerHTML = `
         <div class="horae-progress-container">
             <div class="horae-progress-title">${t('ui.analyzing')}</div>
             <div class="horae-progress-bar">
@@ -18414,77 +18853,76 @@ async function executeBatchScan(batches, options = {}) {
             <button class="horae-progress-cancel"><i class="fa-solid fa-xmark"></i> ${t('ui.cancelSummary')}</button>
         </div>
     `;
-    document.body.appendChild(overlay);
-    const fillEl = overlay.querySelector('.horae-progress-fill');
-    const textEl = overlay.querySelector('.horae-progress-text');
-    const context = getContext();
-    const userName = context?.name1 || t('ui.protagonist');
+        document.body.appendChild(overlay);
+        const fillEl = overlay.querySelector('.horae-progress-fill');
+        const textEl = overlay.querySelector('.horae-progress-text');
+        const context = getContext();
+        const userName = context?.name1 || t('ui.protagonist');
 
-    // 取消：中止fetch请求 + stopGeneration + Promise.race跳出
-    overlay.querySelector('.horae-progress-cancel').addEventListener('click', () => {
-        if (cancelled) return;
-        const hasPartial = scanResults.length > 0;
-        const hint = hasPartial
-            ? t('confirm.aiScanStopConfirm', { n: scanResults.length })
-            : t('confirm.compressCancel');
-        if (!confirm(hint)) return;
-        cancelled = true;
-        fetchAbort.abort();
-        try { context.stopGeneration(); } catch (_) { }
-        cancelResolve();
-        overlay.remove();
-        showToast(hasPartial ? t('toast.scanStopped', { n: scanResults.length }) : t('toast.scanCancelled'), 'info');
-    });
-    const scanResults = [];
+        // 取消：中止fetch请求 + stopGeneration + Promise.race跳出
+        overlay.querySelector('.horae-progress-cancel').addEventListener('click', () => {
+            if (cancelled) return;
+            const hasPartial = scanResults.length > 0;
+            const hint = hasPartial
+                ? t('confirm.aiScanStopConfirm', { n: scanResults.length })
+                : t('confirm.compressCancel');
+            if (!confirm(hint)) return;
+            cancelled = true;
+            fetchAbort.abort();
+            try { context.stopGeneration(); } catch (_) { }
+            cancelResolve();
+            overlay?.remove();
+            showToast(hasPartial ? t('toast.scanStopped', { n: scanResults.length }) : t('toast.scanCancelled'), 'info');
+        });
 
-    // 动态构建允许的标签
-    let allowedTags = 'time、item、event';
-    let forbiddenNote = '禁止输出 agenda/costume/location/atmosphere/characters';
-    if (!includeNpc) forbiddenNote += '/npc';
-    if (!includeAffection) forbiddenNote += '/affection';
-    if (!includeScene) forbiddenNote += '/scene_desc';
-    if (!includeRelationship) forbiddenNote += '/rel';
-    forbiddenNote += ' 等其他标签';
-    if (includeNpc) allowedTags += '、npc';
-    if (includeAffection) allowedTags += '、affection';
-    if (includeScene) allowedTags += '、scene_desc';
-    if (includeRelationship) allowedTags += '、rel';
+        // 动态构建允许的标签
+        let allowedTags = 'time、time_context、item+、item~、item>、itemx、agenda+、agenda~、agenda!、event';
+        let forbiddenNote = '禁止输出 costume/atmosphere/characters';
+        if (!includeNpc) forbiddenNote += '/npc';
+        if (!includeAffection) forbiddenNote += '/affection';
+        if (!includeScene) forbiddenNote += '/location/scene_desc';
+        if (!includeRelationship) forbiddenNote += '/rel';
+        forbiddenNote += ' 等其他标签';
+        if (includeNpc) allowedTags += '、npc';
+        if (includeAffection) allowedTags += '、affection';
+        if (includeScene) allowedTags += '、location、scene_desc';
+        if (includeRelationship) allowedTags += '、rel';
 
-    for (let b = 0; b < batches.length; b++) {
-        if (cancelled) break;
-        const batch = batches[b];
-        textEl.textContent = t('toast.aiBatchDone', { n: `${b + 1}/${batches.length}` });
-        fillEl.style.width = `${Math.round((b / batches.length) * 100)}%`;
+        for (let b = 0; b < batches.length; b++) {
+            if (cancelled) break;
+            const batch = batches[b];
+            textEl.textContent = t('toast.aiBatchDone', { n: `${b + 1}/${batches.length}` });
+            fillEl.style.width = `${Math.round((b / batches.length) * 100)}%`;
 
-        const messagesBlock = batch.map(msg => `【消息#${msg.index}】\n${msg.text}`).join('\n\n');
+            const messagesBlock = batch.map(msg => `【消息#${msg.index}】\n${msg.text}`).join('\n\n');
 
-        // 自定义摘要prompt或默认
-        let batchPrompt;
-        if (settings.customBatchPrompt) {
-            batchPrompt = settings.customBatchPrompt
-                .replace(/\{\{user\}\}/gi, userName)
-                .replace(/\{\{messages\}\}/gi, messagesBlock);
-        } else {
-            let extraFormat = '';
-            let extraRules = '';
-            if (includeNpc) {
-                extraFormat += `\nnpc:角色名|外貌=性格@与${userName}的关系~性别:值~年龄:值~种族:值~职业:值（仅首次出场或信息变化时）`;
-                extraRules += `\n· NPC：首次出场完整记录（含~扩展字段），之后仅变化时写`;
-            }
-            if (includeAffection) {
-                extraFormat += `\naffection:角色名=好感度数值（仅NPC对${userName}的好感，从文本中提取已有数值）`;
-                extraRules += `\n· 好感度：仅从文本中提取明确出现的好感度数值，禁止自行推断`;
-            }
-            if (includeScene) {
-                extraFormat += `\nlocation:当前地点名（场景发生的地点，多级用·分隔如「酒馆·大厅」）\nscene_desc:位于…。该地点的固定物理特征描述（50-150字，仅首次到达或发生永久变化时写）`;
-                extraRules += `\n· 场景：location行写地点名（每条消息都写），scene_desc行仅在首次到达新地点时才写，子级地点仅写相对父级的方位`;
-            }
-            if (includeRelationship) {
-                extraFormat += `\nrel:角色A>角色B=关系类型|备注（角色间关系发生变化时输出）`;
-                extraRules += `\n· 关系：仅在关系新建或变化时写，格式 rel:角色A>角色B=关系类型，备注可选`;
-            }
+            // 自定义摘要prompt或默认
+            let batchPrompt;
+            if (settings.customBatchPrompt) {
+                batchPrompt = settings.customBatchPrompt
+                    .replace(/\{\{user\}\}/gi, userName)
+                    .replace(/\{\{messages\}\}/gi, messagesBlock);
+            } else {
+                let extraFormat = '';
+                let extraRules = '';
+                if (includeNpc) {
+                    extraFormat += `\nnpc:角色名|外貌=性格@与${userName}的关系~性别:值~年龄:值~种族:值~职业:值（仅首次出场或信息变化时）`;
+                    extraRules += `\n· NPC：首次出场完整记录（含~扩展字段），之后仅变化时写`;
+                }
+                if (includeAffection) {
+                    extraFormat += `\naffection:角色名=好感度数值（仅NPC对${userName}的好感，从文本中提取已有数值）`;
+                    extraRules += `\n· 好感度：仅从文本中提取明确出现的好感度数值，禁止自行推断`;
+                }
+                if (includeScene) {
+                    extraFormat += `\nlocation:当前地点名（场景发生的地点，多级用·分隔如「酒馆·大厅」）\nscene_desc:位于…。该地点的固定物理特征描述（50-150字，仅首次到达或发生永久变化时写）`;
+                    extraRules += `\n· 场景：location行写地点名（每条消息都写），scene_desc行仅在首次到达新地点时才写，子级地点仅写相对父级的方位`;
+                }
+                if (includeRelationship) {
+                    extraFormat += `\nrel:角色A>角色B=关系类型|备注（角色间关系发生变化时输出）`;
+                    extraRules += `\n· 关系：仅在关系新建或变化时写，格式 rel:角色A>角色B=关系类型，备注可选`;
+                }
 
-            batchPrompt = `你是剧情分析助手。请逐条分析以下对话记录，为每条消息提取【${allowedTags}】。
+                batchPrompt = `你是剧情分析助手。请逐条分析以下对话记录，为每条消息提取【${allowedTags}】。
 
 核心原则：
 - 只提取文本中明确出现的信息，禁止编造
@@ -18497,20 +18935,25 @@ ${messagesBlock}
 
 ===消息#编号===
 <horae>
-time:日期 时间（从文本中提取，如 2026/2/4 15:00 或 霜降月第三日 黄昏）
-item:emoji物品名(数量)|描述=持有者@位置（新获得的物品，普通物品可省描述）
-item!:emoji物品名(数量)|描述=持有者@位置（重要物品，描述必填）
-item-:物品名（消耗/丢失/用完的物品）${extraFormat}
+time:最后可靠的主线日期 时间（无法确定时继承上一条可靠值，跨日但时刻未知时只写日期）
+time_context:main或flashback|confidence=high/medium/low
+item+:name=物品名|qty=数量|unit=单位|holder=持有人|location=位置|expiresAt=明确过期时间|decayPolicy=per_day:每日减少量
+item~:targetId=ID或name=物品名|delta=数量变化
+item>:targetId=ID或name=物品名|holder=新持有人|location=新位置
+itemx:targetId=ID或name=物品名|status=consumed/lost/destroyed/returned/expired|reason=正文证据
+agenda+:text=内容|createdAt=订立时间|dueAt=截止时间|expiresAt=明确失效时间
+agenda~:targetId=ID或text=内容|status=in_progress/overdue
+agenda!:targetId=ID或text=内容|status=completed/cancelled/expired|evidence=正文证据${extraFormat}
 </horae>
 <horaeevent>
 event:重要程度|事件描述
 </horaeevent>
 
 【规则】
-· time：从文本中提取当前场景的日期时间，必填（没有明确时间则根据上下文推断）
+· time：从文本提取；不明确则继承前一条可靠主线值并降低confidence，禁止编造精确日期或时刻。闪回不得推进主线
 · event：本条消息中发生的关键剧情，每条消息至少一个 event
-· 物品仅在获得、消耗、状态改变时记录，无变化则不写 item 行
-· item格式：emoji前缀如🔑🍞，单件不写(1)，位置需精确（❌地上 ✅酒馆大厅桌上）
+· 物品仅在获得、消耗、状态改变时记录，无变化则不写；关键物品不能因长期未提及而消失
+· 计划到达截止时间只标overdue；完成、取消或失效必须有本条消息中的明确证据
 · 重要程度判断：日常对话=一般，推动剧情=重要，关键转折=关键
 · ${userName} 是主角名${extraRules}
 · 再次强调：只允许 ${allowedTags}，${forbiddenNote}
@@ -18527,116 +18970,210 @@ event:重要程度|事件描述
   ✅ 正确示范："U在酒馆向艾伦打听黑市商人的下落，艾伦起初警惕，但在U递出10枚金币后，透露商人明晚会在废弃码头出现。艾伦对U的态度由戒备转为贪婪。两人约定明晚一起行动。"
 ★ 严禁无中生有：禁止写出原文未明确指出的情绪（禁止使用“这引出了...的珍视”、“体现了...的心态”等阅读理解句式）。
 ★ 严禁氛围总结：禁止出现“显得...带有生活气息”、“气氛变得...”等主观感悟。`;
-        }
-
-        // 反转述模式下条目为 [USER行动]+[AI回复] 双段，模板里没明确说这点，AI 容易只读后半段
-        if (settings.antiParaphraseMode) {
-            batchPrompt += `\n\n${_antiParaphraseSnippets().batchHint}`;
-        }
-
-        try {
-            const response = await Promise.race([
-                _generateForAuxTask(batchPrompt, { kind: 'summary' }),
-                cancelPromise.then(() => null)
-            ]);
-            if (cancelled) break;
-            if (!response) {
-                console.warn(`[Horae] 第 ${b + 1} 批：AI 未返回内容`);
-                showToast(t('toast.aiBatchNoContent', { n: b + 1 }), 'warning');
-                continue;
             }
-            const cleanedResponse = response.replace(/<think(?:ing)?[\s>][\s\S]*?<\/think(?:ing)?>/gi, '');
-            const segments = cleanedResponse.split(/={2,}\s*(?:消息|[Mm]essage)\s*#\s*(\d+)\s*={2,}/);
-            if (segments.length <= 1) {
-                console.warn(`[Horae] 第 ${b + 1} 批：AI 回复格式不匹配（未找到 ===消息#N=== 分隔符）`, response.substring(0, 300));
-                showToast(t('toast.aiBatchFormatError', { n: b + 1 }), 'warning');
-                continue;
+
+            // 反转述模式下条目为 [USER行动]+[AI回复] 双段，模板里没明确说这点，AI 容易只读后半段
+            if (settings.antiParaphraseMode) {
+                batchPrompt += `\n\n${_antiParaphraseSnippets().batchHint}`;
             }
-            const batchWritten = [];
-            for (let s = 1; s < segments.length; s += 2) {
-                const msgIndex = parseInt(segments[s]);
-                const content = segments[s + 1] || '';
-                if (isNaN(msgIndex)) continue;
-                const parsed = horaeManager.parseHoraeTag(content);
-                if (parsed) {
-                    parsed.costumes = {};
-                    if (!includeScene) parsed.scene = {};
-                    parsed.agenda = [];
-                    parsed.deletedAgenda = [];
-                    parsed.deletedItems = [];
-                    if (!includeNpc) parsed.npcs = {};
-                    if (!includeAffection) parsed.affection = {};
-                    if (!includeRelationship) parsed.relationships = [];
 
-                    const existingMeta = horaeManager.getMessageMeta(msgIndex) || createEmptyMeta();
-                    const newMeta = horaeManager.mergeParsedToMeta(existingMeta, parsed);
-                    if (newMeta._tableUpdates) {
-                        newMeta.tableContributions = newMeta._tableUpdates;
-                        delete newMeta._tableUpdates;
-                    }
-                    newMeta._aiScanned = true;
+            try {
+                const response = await Promise.race([
+                    _generateForAuxTask(batchPrompt, { kind: 'summary' }),
+                    cancelPromise.then(() => null)
+                ]);
+                if (cancelled) break;
+                if (!response) {
+                    console.warn(`[Horae] 第 ${b + 1} 批：AI 未返回内容`);
+                    showToast(t('toast.aiBatchNoContent', { n: b + 1 }), 'warning');
+                    continue;
+                }
+                const cleanedResponse = response.replace(/<think(?:ing)?[\s>][\s\S]*?<\/think(?:ing)?>/gi, '');
+                const segments = cleanedResponse.split(/={2,}\s*(?:消息|[Mm]essage)\s*#\s*(\d+)\s*={2,}/);
+                if (segments.length <= 1) {
+                    console.warn(`[Horae] 第 ${b + 1} 批：AI 回复格式不匹配（未找到 ===消息#N=== 分隔符）`, response.substring(0, 300));
+                    showToast(t('toast.aiBatchFormatError', { n: b + 1 }), 'warning');
+                    continue;
+                }
+                const batchWritten = [];
+                for (let s = 1; s < segments.length; s += 2) {
+                    const msgIndex = parseInt(segments[s]);
+                    const content = segments[s + 1] || '';
+                    if (isNaN(msgIndex)) continue;
+                    const parsed = horaeManager.parseHoraeTag(content);
+                    if (parsed) {
+                        parsed.costumes = {};
+                        if (!includeScene) parsed.scene = {};
+                        parsed.agenda = [];
+                        parsed.deletedAgenda = [];
+                        parsed.deletedItems = [];
+                        if (!includeNpc) parsed.npcs = {};
+                        if (!includeAffection) parsed.affection = {};
+                        if (!includeRelationship) parsed.relationships = [];
 
-                    // 立即写入 chat
-                    if (newMeta.scene?.location && newMeta.scene?.scene_desc) {
-                        horaeManager._updateLocationMemory(newMeta.scene.location, newMeta.scene.scene_desc);
-                    }
-                    if (newMeta.relationships?.length > 0) {
-                        horaeManager._mergeRelationships(newMeta.relationships);
-                    }
-                    horaeManager.setMessageMeta(msgIndex, newMeta);
-                    injectHoraeTagToMessage(msgIndex, newMeta);
+                        const existingMeta = horaeManager.getMessageMeta(msgIndex);
+                        const originalMeta = existingMeta?._aiScanned
+                            ? restoreAiScannedMeta(existingMeta)
+                            : existingMeta;
+                        let newMeta = horaeManager.mergeParsedToMeta(originalMeta || createEmptyMeta(), parsed);
+                        newMeta.events = mergeAiScanRecords(originalMeta?.events, parsed.events || (parsed.event ? [parsed.event] : []));
+                        newMeta.itemLifecycle = mergeAiScanRecords(originalMeta?.itemLifecycle, parsed.itemLifecycle);
+                        newMeta.agendaLifecycle = mergeAiScanRecords(originalMeta?.agendaLifecycle, parsed.agendaLifecycle);
+                        newMeta.relationships = mergeAiScanRecords(originalMeta?.relationships, parsed.relationships);
+                        if (newMeta._tableUpdates) {
+                            newMeta.tableContributions = newMeta._tableUpdates;
+                            delete newMeta._tableUpdates;
+                        }
+                        newMeta = markAiScannedMeta(newMeta, existingMeta);
 
+                        // 立即写入 chat
+                        if (newMeta.scene?.location && newMeta.scene?.scene_desc) {
+                            horaeManager._updateLocationMemory(newMeta.scene.location, newMeta.scene.scene_desc);
+                        }
+                        if (newMeta.relationships?.length > 0) {
+                            horaeManager._mergeRelationships(newMeta.relationships);
+                        }
+                        horaeManager.setMessageMeta(msgIndex, newMeta);
+                        injectHoraeTagToMessage(msgIndex, newMeta);
+
+                        const chatRef = horaeManager.getChat();
+                        const preview = (chatRef[msgIndex]?.mes || '').substring(0, 60);
+                        const result = { msgIndex, newMeta, preview, _deleted: false };
+                        const duplicateIndex = scanResults.findIndex(item => item.msgIndex === msgIndex);
+                        if (duplicateIndex >= 0) scanResults[duplicateIndex] = result;
+                        else scanResults.push(result);
+                        batchWritten.push(msgIndex);
+                    }
+                }
+                // 每批完成后保存并更新 _pendingScanReview 标记
+                if (batchWritten.length > 0) {
                     const chatRef = horaeManager.getChat();
-                    const preview = (chatRef[msgIndex]?.mes || '').substring(0, 60);
-                    scanResults.push({ msgIndex, newMeta, preview, _deleted: false });
-                    batchWritten.push(msgIndex);
-                }
-            }
-            // 每批完成后保存并更新 _pendingScanReview 标记
-            if (batchWritten.length > 0) {
-                const chatRef = horaeManager.getChat();
-                if (chatRef?.[0]) {
-                    if (!chatRef[0].horae_meta) chatRef[0].horae_meta = createEmptyMeta();
-                    if (!chatRef[0].horae_meta._pendingScanReview) {
-                        chatRef[0].horae_meta._pendingScanReview = {
-                            msgIndices: [], options, startedAt: new Date().toISOString()
-                        };
+                    if (chatRef?.[0]) {
+                        if (!chatRef[0].horae_meta) chatRef[0].horae_meta = createEmptyMeta();
+                        if (!chatRef[0].horae_meta._pendingScanReview) {
+                            chatRef[0].horae_meta._pendingScanReview = {
+                                msgIndices: [], options, startedAt: new Date().toISOString()
+                            };
+                        }
+                        const pending = chatRef[0].horae_meta._pendingScanReview;
+                        pending.msgIndices = [...new Set([...(pending.msgIndices || []), ...batchWritten])];
                     }
-                    chatRef[0].horae_meta._pendingScanReview.msgIndices.push(...batchWritten);
+                    horaeManager.rebuildTableData();
+                    try { await context.saveChat(); } catch (_) { }
                 }
-                horaeManager.rebuildTableData();
-                try { await context.saveChat(); } catch (_) { }
+            } catch (err) {
+                if (cancelled || err?.name === 'AbortError') break;
+                console.error(`[Horae] 第 ${b + 1} 批摘要失败:`, err);
+                showToast(t('toast.aiBatchFailed', { n: b + 1 }), 'error');
             }
-        } catch (err) {
-            if (cancelled || err?.name === 'AbortError') break;
-            console.error(`[Horae] 第 ${b + 1} 批摘要失败:`, err);
-            showToast(t('toast.aiBatchFailed', { n: b + 1 }), 'error');
-        }
 
-        if (b < batches.length - 1 && !cancelled) {
-            textEl.textContent = t('toast.aiBatchDone', { n: b + 1 });
-            await Promise.race([
-                new Promise(r => setTimeout(r, 2000)),
-                cancelPromise
-            ]);
+            if (b < batches.length - 1 && !cancelled) {
+                textEl.textContent = t('toast.aiBatchDone', { n: b + 1 });
+                await Promise.race([
+                    new Promise(r => setTimeout(r, 2000)),
+                    cancelPromise
+                ]);
+            }
         }
+    } finally {
+        window.fetch = _origFetch;
+        overlay?.remove();
     }
-    window.fetch = _origFetch;
-    if (!cancelled) overlay.remove();
-    return scanResults;
+    return scanResults.sort((a, b) => a.msgIndex - b.msgIndex);
 }
 
 /** 从暂存结果中按分类提取审阅条目 */
+function getAiScanBaseline(meta) {
+    if (!meta?._aiScanned) return {};
+    return restoreAiScannedMeta(meta) || {};
+}
+
+function isChangedScanValue(value, baselineValue) {
+    return JSON.stringify(value) !== JSON.stringify(baselineValue);
+}
+
+function getReviewClockValue(meta) {
+    return {
+        date: meta?.timestamp?.story_date || meta?.storyClock?.rawDate || '',
+        time: meta?.timestamp?.story_time || meta?.storyClock?.rawTime || '',
+        timeline: meta?.storyClock?.timeline || meta?.storyClock?.mode || '',
+        confidence: meta?.storyClock?.confidence || '',
+        source: meta?.storyClock?.source || '',
+    };
+}
+
+function hasReviewableAiScanChanges(meta, baseline) {
+    const changedObjectValues = (current, original) => Object.entries(current || {})
+        .some(([key, value]) => isChangedScanValue(value, original?.[key]));
+    const clock = getReviewClockValue(meta);
+    const baselineClock = getReviewClockValue(baseline);
+    const hasClock = Object.values(clock).some(Boolean) && isChangedScanValue(clock, baselineClock);
+
+    return hasClock ||
+        getAddedAiScanRecordIndices(meta?.events, baseline?.events).length > 0 ||
+        changedObjectValues(meta?.items, baseline?.items) ||
+        getAddedAiScanRecordIndices(meta?.itemLifecycle, baseline?.itemLifecycle).length > 0 ||
+        getAddedAiScanRecordIndices(meta?.agenda, baseline?.agenda).length > 0 ||
+        getAddedAiScanRecordIndices(meta?.agendaLifecycle, baseline?.agendaLifecycle).length > 0 ||
+        changedObjectValues(meta?.npcs, baseline?.npcs) ||
+        changedObjectValues(meta?.affection, baseline?.affection) ||
+        (!!meta?.scene?.location && isChangedScanValue(meta.scene, baseline?.scene)) ||
+        getAddedAiScanRecordIndices(meta?.relationships, baseline?.relationships).length > 0;
+}
+
 function extractReviewCategories(scanResults) {
-    const categories = { events: [], items: [], npcs: [], affection: [], scenes: [], relationships: [] };
+    const categories = { clock: [], events: [], items: [], agenda: [], npcs: [], affection: [], scenes: [], relationships: [] };
+
+    const formatValue = value => {
+        if (value == null || value === '') return '';
+        if (Array.isArray(value)) return value.join('、');
+        if (typeof value === 'object') {
+            if (value.value !== undefined) return `${value.value}${value.unit || ''}`;
+            try { return JSON.stringify(value); } catch (_) { return String(value); }
+        }
+        return String(value);
+    };
+    const actionLabel = action => {
+        const normalized = String(action || 'update').toLowerCase();
+        if (normalized === 'add' || normalized === 'create') return t('timeline.actionAdd');
+        if (normalized === 'close' || normalized === 'remove') return t('timeline.actionClose');
+        return t('timeline.actionUpdate');
+    };
+    const statusLabel = status => {
+        const key = {
+            pending: 'lifecycle.pending',
+            in_progress: 'lifecycle.inProgress',
+            overdue: 'lifecycle.overdue',
+            expired: 'lifecycle.expired',
+            active: 'lifecycle.active',
+            archived: 'lifecycle.archived',
+        }[status];
+        return key ? t(key) : formatValue(status);
+    };
 
     for (let ri = 0; ri < scanResults.length; ri++) {
         const r = scanResults[ri];
         if (r._deleted) continue;
         const meta = r.newMeta;
+        const baseline = getAiScanBaseline(meta);
+
+        const clock = getReviewClockValue(meta);
+        if (Object.values(clock).some(Boolean) && isChangedScanValue(clock, getReviewClockValue(baseline))) {
+            const confidenceKey = {
+                high: 'status.confidenceHigh',
+                medium: 'status.confidenceMedium',
+                low: 'status.confidenceLow',
+            }[clock.confidence];
+            categories.clock.push({
+                resultIndex: ri, field: 'storyTime', key: 'clock',
+                msgIndex: r.msgIndex,
+                text: [clock.date, clock.time].filter(Boolean).join(' ') || t('ui.missingTimestamp'),
+                sub: [clock.timeline, confidenceKey ? `${t('status.clockConfidence')}: ${t(confidenceKey)}` : ''].filter(Boolean).join(' · '),
+            });
+        }
 
         if (meta.events?.length > 0) {
-            for (let ei = 0; ei < meta.events.length; ei++) {
+            for (const ei of getAddedAiScanRecordIndices(meta.events, baseline.events)) {
                 categories.events.push({
                     resultIndex: ri, field: 'events', subIndex: ei,
                     msgIndex: r.msgIndex,
@@ -18648,6 +19185,7 @@ function extractReviewCategories(scanResults) {
         }
 
         for (const [name, info] of Object.entries(meta.items || {})) {
+            if (!isChangedScanValue(info, baseline.items?.[name])) continue;
             const desc = info.description || '';
             const loc = [info.holder, info.location ? `@${info.location}` : ''].filter(Boolean).join('');
             categories.items.push({
@@ -18659,7 +19197,66 @@ function extractReviewCategories(scanResults) {
             });
         }
 
+        for (const li of getAddedAiScanRecordIndices(meta.itemLifecycle, baseline.itemLifecycle)) {
+            const record = meta.itemLifecycle[li] || {};
+            const quantity = record.qty ?? record.quantity;
+            const details = [
+                actionLabel(record.action || record.op),
+                quantity !== undefined ? formatValue(quantity) : '',
+                record.delta !== undefined ? `${Number(record.delta) > 0 ? '+' : ''}${formatValue(record.delta)}` : '',
+                formatValue(record.holder),
+                record.location ? `@${formatValue(record.location)}` : '',
+                statusLabel(record.status),
+            ].filter(Boolean);
+            categories.items.push({
+                resultIndex: ri, field: 'itemLifecycle', subIndex: li,
+                msgIndex: r.msgIndex,
+                text: record.name || record.targetId || record.id || t('tabs.items'),
+                sub: details.join(' · '),
+                desc: record.description || record.reason || record.evidence || '',
+                time: record.lastChangedAt || record.acquiredAt || record.expiresAt || '',
+            });
+        }
+
+        const addedAgendaLifecycleIndices = getAddedAiScanRecordIndices(meta.agendaLifecycle, baseline.agendaLifecycle);
+        const lifecycleAgendaTexts = new Set(addedAgendaLifecycleIndices
+            .map(index => meta.agendaLifecycle[index])
+            .map(item => String(item?.text || item?.title || '').trim())
+            .filter(Boolean));
+        for (const ai of getAddedAiScanRecordIndices(meta.agenda, baseline.agenda)) {
+            const item = meta.agenda[ai] || {};
+            const text = String(item.text || item.title || '').trim();
+            if (!text || lifecycleAgendaTexts.has(text)) continue;
+            categories.agenda.push({
+                resultIndex: ri, field: 'agenda', subIndex: ai,
+                msgIndex: r.msgIndex,
+                text,
+                sub: [statusLabel(item.status), formatValue(item.location)].filter(Boolean).join(' · '),
+                time: item.dueAt || item.date || item.createdAt || '',
+            });
+        }
+
+        for (const li of addedAgendaLifecycleIndices) {
+            const record = meta.agendaLifecycle[li] || {};
+            const details = [
+                actionLabel(record.action || record.op),
+                statusLabel(record.status),
+                record.dueAt ? `${t('timeline.agendaDue')}: ${formatValue(record.dueAt)}` : '',
+                formatValue(record.location),
+                formatValue(record.participants),
+            ].filter(Boolean);
+            categories.agenda.push({
+                resultIndex: ri, field: 'agendaLifecycle', subIndex: li,
+                msgIndex: r.msgIndex,
+                text: record.text || record.title || record.targetId || record.id || t('timeline.agenda'),
+                sub: details.join(' · '),
+                desc: record.completionEvidence || record.reason || record.evidence || '',
+                time: record.lastChangedAt || record.createdAt || record.expiresAt || '',
+            });
+        }
+
         for (const [name, info] of Object.entries(meta.npcs || {})) {
+            if (!isChangedScanValue(info, baseline.npcs?.[name])) continue;
             categories.npcs.push({
                 resultIndex: ri, field: 'npcs', key: name,
                 msgIndex: r.msgIndex,
@@ -18669,6 +19266,7 @@ function extractReviewCategories(scanResults) {
         }
 
         for (const [name, val] of Object.entries(meta.affection || {})) {
+            if (!isChangedScanValue(val, baseline.affection?.[name])) continue;
             categories.affection.push({
                 resultIndex: ri, field: 'affection', key: name,
                 msgIndex: r.msgIndex,
@@ -18678,18 +19276,18 @@ function extractReviewCategories(scanResults) {
         }
 
         // 场景记忆
-        if (meta.scene?.location && meta.scene?.scene_desc) {
+        if (meta.scene?.location && isChangedScanValue(meta.scene, baseline.scene)) {
             categories.scenes.push({
                 resultIndex: ri, field: 'scene', key: meta.scene.location,
                 msgIndex: r.msgIndex,
                 text: meta.scene.location,
-                sub: meta.scene.scene_desc
+                sub: meta.scene.scene_desc || ''
             });
         }
 
         // 关系网络
         if (meta.relationships?.length > 0) {
-            for (let rri = 0; rri < meta.relationships.length; rri++) {
+            for (const rri of getAddedAiScanRecordIndices(meta.relationships, baseline.relationships)) {
                 const rel = meta.relationships[rri];
                 categories.relationships.push({
                     resultIndex: ri, field: 'relationships', subIndex: rri,
@@ -18721,19 +19319,33 @@ function extractReviewCategories(scanResults) {
 
 /** 审阅条目唯一标识 */
 function makeReviewKey(item) {
-    if (item.field === 'events') return `${item.resultIndex}-events-${item.subIndex}`;
-    if (item.field === 'relationships') return `${item.resultIndex}-relationships-${item.subIndex}`;
+    if (Number.isInteger(item.subIndex)) return `${item.resultIndex}-${item.field}-${item.subIndex}`;
     return `${item.resultIndex}-${item.field}-${item.key}`;
 }
 
 /** 摘要审阅弹窗 — 按分类展示，支持逐条删除和补充摘要 */
+async function restoreUnreviewableScanResults(scanResults) {
+    const chat = horaeManager.getChat();
+    const pendingIndices = chat?.[0]?.horae_meta?._pendingScanReview?.msgIndices || [];
+    const rollbackSet = new Set(pendingIndices);
+    for (const result of scanResults) rollbackSet.add(result.msgIndex);
+    for (const index of rollbackSet) restoreAiScannedMessage(chat, index);
+    clearPendingScanReview(chat);
+    rebuildAfterAiScanRestore();
+    try { await getContext().saveChat(); } catch (_) { }
+    refreshAllDisplays();
+    renderCustomTablesList();
+}
+
 function showScanReviewModal(scanResults, scanOptions) {
     const categories = extractReviewCategories(scanResults);
     const deletedSet = new Set();
 
     const tabs = [
-        { id: 'events', label: '剧情轨迹', icon: 'fa-clock-rotate-left', items: categories.events },
+        { id: 'clock', label: t('timeline.currentStoryDate'), icon: 'fa-calendar-day', items: categories.clock },
+        { id: 'events', label: t('rpgPrompts.plotTrajectory'), icon: 'fa-clock-rotate-left', items: categories.events },
         { id: 'items', label: t('tabs.items'), icon: 'fa-box-open', items: categories.items },
+        { id: 'agenda', label: t('timeline.agenda'), icon: 'fa-list-check', items: categories.agenda },
         { id: 'npcs', label: t('tabs.characters'), icon: 'fa-user', items: categories.npcs },
         { id: 'affection', label: t('characters.affection'), icon: 'fa-heart', items: categories.affection },
         { id: 'scenes', label: t('tabs.locations'), icon: 'fa-map-location-dot', items: categories.scenes },
@@ -18741,6 +19353,7 @@ function showScanReviewModal(scanResults, scanOptions) {
     ].filter(tab => tab.items.length > 0);
 
     if (tabs.length === 0) {
+        void restoreUnreviewableScanResults(scanResults);
         showToast(t('toast.insufficientEvents'), 'warning');
         return;
     }
@@ -18750,7 +19363,7 @@ function showScanReviewModal(scanResults, scanOptions) {
 
     const activeTab = tabs[0].id;
     const tabsHtml = tabs.map(tab =>
-        `<button class="horae-review-tab ${tab.id === activeTab ? 'active' : ''}" data-tab="${tab.id}">
+        `<button type="button" class="horae-review-tab ${tab.id === activeTab ? 'active' : ''}" id="horae-review-tab-${tab.id}" data-tab="${tab.id}" role="tab" aria-selected="${tab.id === activeTab}" aria-controls="horae-review-panel-${tab.id}" tabindex="${tab.id === activeTab ? '0' : '-1'}">
             <i class="fa-solid ${tab.icon}"></i> ${tab.label} <span class="tab-count">${tab.items.length}</span>
         </button>`
     ).join('');
@@ -18760,7 +19373,7 @@ function showScanReviewModal(scanResults, scanOptions) {
             const itemKey = escapeHtml(makeReviewKey(item));
             const levelAttr = item.level ? ` data-level="${escapeHtml(item.level)}"` : '';
             const levelBadge = item.level ? `<span class="horae-level-badge ${(item.level === '关键' || item.level === '關鍵') ? 'critical' : item.level === '重要' ? 'important' : ''}" style="font-size:10px;margin-right:4px;">${escapeHtml(item.level)}</span>` : '';
-            const descHtml = item.desc ? `<div class="horae-review-item-sub" style="font-style:italic;opacity:0.8;">📝 ${escapeHtml(item.desc)}</div>` : '';
+            const descHtml = item.desc ? `<div class="horae-review-item-sub horae-review-item-desc"><i class="fa-solid fa-note-sticky" aria-hidden="true"></i> ${escapeHtml(item.desc)}</div>` : '';
             return `<div class="horae-review-item" data-key="${itemKey}"${levelAttr}>
                 <div class="horae-review-item-body">
                     <div class="horae-review-item-title">${levelBadge}${escapeHtml(item.text)}</div>
@@ -18769,12 +19382,12 @@ function showScanReviewModal(scanResults, scanOptions) {
                     ${item.time ? `<div class="horae-review-item-sub">${escapeHtml(item.time)}</div>` : ''}
                     <div class="horae-review-item-msg">#${item.msgIndex}</div>
                 </div>
-                <button class="horae-review-delete-btn" data-key="${itemKey}" title="${t('ui.deleteRestore')}">
+                <button type="button" class="horae-review-delete-btn" data-key="${itemKey}" title="${t('ui.deleteRestore')}" aria-label="${t('ui.deleteRestore')}" aria-pressed="false">
                     <i class="fa-solid fa-trash-can"></i>
                 </button>
             </div>`;
         }).join('');
-        return `<div class="horae-review-panel ${tab.id === activeTab ? 'active' : ''}" data-panel="${tab.id}">
+        return `<div class="horae-review-panel ${tab.id === activeTab ? 'active' : ''}" id="horae-review-panel-${tab.id}" data-panel="${tab.id}" role="tabpanel" aria-labelledby="horae-review-tab-${tab.id}" ${tab.id === activeTab ? '' : 'hidden'}>
             ${itemsHtml || `<div class="horae-review-empty">${t('ui.noReviewData')}</div>`}
         </div>`;
     }).join('');
@@ -18787,7 +19400,7 @@ function showScanReviewModal(scanResults, scanOptions) {
                 <span>${t('ui.summaryReview')}</span>
                 <span style="font-size:12px;color:var(--horae-text-muted);">${t('ui.totalCount', { n: totalCount })}</span>
             </div>
-            <div class="horae-review-tabs">${tabsHtml}</div>
+            <div class="horae-review-tabs" role="tablist">${tabsHtml}</div>
             <div class="horae-review-body">${panelsHtml}</div>
             <div class="horae-modal-footer horae-review-footer">
                 <div class="horae-review-stats">${t('ui.deletedCount')} <strong id="horae-review-del-count">0</strong> ${t('ui.items')}</div>
@@ -18805,10 +19418,21 @@ function showScanReviewModal(scanResults, scanOptions) {
     // tab 切换
     modal.querySelectorAll('.horae-review-tab').forEach(tabBtn => {
         tabBtn.addEventListener('click', () => {
-            modal.querySelectorAll('.horae-review-tab').forEach(el => el.classList.remove('active'));
-            modal.querySelectorAll('.horae-review-panel').forEach(p => p.classList.remove('active'));
+            modal.querySelectorAll('.horae-review-tab').forEach(el => {
+                el.classList.remove('active');
+                el.setAttribute('aria-selected', 'false');
+                el.setAttribute('tabindex', '-1');
+            });
+            modal.querySelectorAll('.horae-review-panel').forEach(p => {
+                p.classList.remove('active');
+                p.hidden = true;
+            });
             tabBtn.classList.add('active');
-            modal.querySelector(`.horae-review-panel[data-panel="${tabBtn.dataset.tab}"]`)?.classList.add('active');
+            tabBtn.setAttribute('aria-selected', 'true');
+            tabBtn.setAttribute('tabindex', '0');
+            const activePanel = modal.querySelector(`.horae-review-panel[data-panel="${tabBtn.dataset.tab}"]`);
+            activePanel?.classList.add('active');
+            if (activePanel) activePanel.hidden = false;
         });
     });
 
@@ -18821,10 +19445,12 @@ function showScanReviewModal(scanResults, scanOptions) {
                 deletedSet.delete(key);
                 itemEl.classList.remove('deleted');
                 btn.innerHTML = '<i class="fa-solid fa-trash-can"></i>';
+                btn.setAttribute('aria-pressed', 'false');
             } else {
                 deletedSet.add(key);
                 itemEl.classList.add('deleted');
                 btn.innerHTML = '<i class="fa-solid fa-rotate-left"></i>';
+                btn.setAttribute('aria-pressed', 'true');
             }
             updateReviewStats();
         });
@@ -18861,9 +19487,7 @@ function showScanReviewModal(scanResults, scanOptions) {
         }
         // 清除待审阅标记
         const chat = horaeManager.getChat();
-        if (chat?.[0]?.horae_meta?._pendingScanReview) {
-            delete chat[0].horae_meta._pendingScanReview;
-        }
+        clearPendingScanReview(chat);
         horaeManager.rebuildTableData();
         await getContext().saveChat();
         modal.remove();
@@ -18881,25 +19505,15 @@ function showScanReviewModal(scanResults, scanOptions) {
         const pendingIndices = chat?.[0]?.horae_meta?._pendingScanReview?.msgIndices || [];
         const rollbackSet = new Set(pendingIndices);
         for (const r of scanResults) rollbackSet.add(r.msgIndex);
+        let restoredCount = 0;
         for (const idx of rollbackSet) {
-            const meta = chat?.[idx]?.horae_meta;
-            if (!meta?._aiScanned) continue;
-            meta.events = [];
-            meta.items = {};
-            meta.npcs = {};
-            meta.affection = {};
-            if (meta.scene) meta.scene = {};
-            if (meta.relationships) meta.relationships = [];
-            delete meta._aiScanned;
-            injectHoraeTagToMessage(idx, meta);
+            if (restoreAiScannedMessage(chat, idx)) restoredCount++;
         }
-        if (chat?.[0]?.horae_meta?._pendingScanReview) {
-            delete chat[0].horae_meta._pendingScanReview;
-        }
-        horaeManager.rebuildTableData();
+        clearPendingScanReview(chat);
+        rebuildAfterAiScanRestore();
         try { await getContext().saveChat(); } catch (_) { }
         modal.remove();
-        showToast(t('toast.aiSummaryUndone', { n: rollbackSet.size }), 'info');
+        showToast(t('toast.aiSummaryUndone', { n: restoredCount }), 'info');
         refreshAllDisplays();
         renderCustomTablesList();
     };
@@ -18938,7 +19552,14 @@ function showScanReviewModal(scanResults, scanOptions) {
         if (cb.length > 0) rescanBatches.push(cb);
 
         const newResults = await executeBatchScan(rescanBatches, scanOptions);
-        const merged = scanResults.filter(r => !r._deleted).concat(newResults);
+        const mergedByMessage = new Map();
+        for (const result of scanResults) {
+            if (!result._deleted) mergedByMessage.set(result.msgIndex, result);
+        }
+        for (const result of newResults) {
+            if (!result._deleted) mergedByMessage.set(result.msgIndex, result);
+        }
+        const merged = [...mergedByMessage.values()].sort((a, b) => a.msgIndex - b.msgIndex);
         showScanReviewModal(merged, scanOptions);
     });
 }
@@ -18946,16 +19567,26 @@ function showScanReviewModal(scanResults, scanOptions) {
 /** 将删除标记应用到 scanResults 的实际数据 */
 function applyDeletedToResults(scanResults, deletedSet, categories) {
     const deleteMap = new Map();
-    const allItems = [...categories.events, ...categories.items, ...categories.npcs, ...categories.affection, ...categories.scenes, ...categories.relationships];
+    const allItems = [...categories.clock, ...categories.events, ...categories.items, ...categories.agenda, ...categories.npcs, ...categories.affection, ...categories.scenes, ...categories.relationships];
     for (const key of deletedSet) {
         const item = allItems.find(i => makeReviewKey(i) === key);
         if (!item) continue;
         if (!deleteMap.has(item.resultIndex)) {
-            deleteMap.set(item.resultIndex, { events: new Set(), items: new Set(), npcs: new Set(), affection: new Set(), scene: new Set(), relationships: new Set() });
+            deleteMap.set(item.resultIndex, {
+                events: new Set(),
+                items: new Set(),
+                itemLifecycle: new Set(),
+                agenda: new Set(),
+                agendaLifecycle: new Set(),
+                storyTime: new Set(),
+                npcs: new Set(),
+                affection: new Set(),
+                scene: new Set(),
+                relationships: new Set(),
+            });
         }
         const dm = deleteMap.get(item.resultIndex);
-        if (item.field === 'events') dm.events.add(item.subIndex);
-        else if (item.field === 'relationships') dm.relationships.add(item.subIndex);
+        if (Number.isInteger(item.subIndex)) dm[item.field]?.add(item.subIndex);
         else if (item.field === 'scene') dm.scene.add(item.key);
         else dm[item.field]?.add(item.key);
     }
@@ -18963,25 +19594,48 @@ function applyDeletedToResults(scanResults, deletedSet, categories) {
     for (const [ri, dm] of deleteMap) {
         const meta = scanResults[ri]?.newMeta;
         if (!meta) continue;
-        if (dm.events.size > 0 && meta.events) {
-            const indices = [...dm.events].sort((a, b) => b - a);
-            for (const idx of indices) meta.events.splice(idx, 1);
-        }
-        if (dm.relationships.size > 0 && meta.relationships) {
-            const indices = [...dm.relationships].sort((a, b) => b - a);
-            for (const idx of indices) meta.relationships.splice(idx, 1);
+        const baseline = getAiScanBaseline(meta);
+        for (const field of ['events', 'itemLifecycle', 'agenda', 'agendaLifecycle', 'relationships']) {
+            if (dm[field].size > 0 && Array.isArray(meta[field])) {
+                const indices = [...dm[field]].sort((a, b) => b - a);
+                for (const idx of indices) meta[field].splice(idx, 1);
+            }
         }
         if (dm.scene.size > 0 && meta.scene) {
-            meta.scene = {};
+            meta.scene = _deepCloneData(baseline.scene) || {};
         }
-        for (const name of dm.items) delete meta.items?.[name];
-        for (const name of dm.npcs) delete meta.npcs?.[name];
-        for (const name of dm.affection) delete meta.affection?.[name];
+        if (dm.storyTime.size > 0) {
+            meta.timestamp = _deepCloneData(baseline.timestamp) || { story_date: '', story_time: '', absolute: '' };
+            meta.storyClock = _deepCloneData(baseline.storyClock) || null;
+        }
+        for (const name of dm.items) {
+            if (Object.prototype.hasOwnProperty.call(baseline.items || {}, name)) {
+                meta.items[name] = _deepCloneData(baseline.items[name]);
+            } else {
+                delete meta.items?.[name];
+            }
+        }
+        for (const name of dm.npcs) {
+            if (Object.prototype.hasOwnProperty.call(baseline.npcs || {}, name)) {
+                meta.npcs[name] = _deepCloneData(baseline.npcs[name]);
+            } else {
+                delete meta.npcs?.[name];
+            }
+        }
+        for (const name of dm.affection) {
+            if (Object.prototype.hasOwnProperty.call(baseline.affection || {}, name)) {
+                meta.affection[name] = _deepCloneData(baseline.affection[name]);
+            } else {
+                delete meta.affection?.[name];
+            }
+        }
 
-        const hasData = (meta.events?.length > 0) || Object.keys(meta.items || {}).length > 0 ||
-            Object.keys(meta.npcs || {}).length > 0 || Object.keys(meta.affection || {}).length > 0 ||
-            (meta.scene?.scene_desc) || (meta.relationships?.length > 0);
-        if (!hasData) scanResults[ri]._deleted = true;
+        if (!hasReviewableAiScanChanges(meta, baseline)) {
+            const chat = horaeManager.getChat();
+            restoreAiScannedMessage(chat, scanResults[ri].msgIndex);
+            scanResults[ri].newMeta = chat?.[scanResults[ri].msgIndex]?.horae_meta || createEmptyMeta();
+            scanResults[ri]._deleted = true;
+        }
     }
 }
 
@@ -18998,6 +19652,12 @@ function rebuildScanResultsFromChat(msgIndices) {
         results.push({ msgIndex: idx, newMeta: meta, preview, _deleted: false });
     }
     return results;
+}
+
+function clearPendingScanReview(chat) {
+    if (chat?.[0]?.horae_meta?._pendingScanReview) {
+        delete chat[0].horae_meta._pendingScanReview;
+    }
 }
 
 /** 中断恢复弹窗（三按钮：审阅 / 丢弃 / 保留） */
@@ -19035,7 +19695,7 @@ function _showPendingScanRecoveryModal(chat, pending, count) {
         if (rebuilt.length > 0) {
             showScanReviewModal(rebuilt, pending.options || {});
         } else {
-            delete chat[0].horae_meta._pendingScanReview;
+            clearPendingScanReview(chat);
             getContext().saveChat();
             showToast(t('toast.noAiSummaryData'), 'info');
         }
@@ -19043,7 +19703,7 @@ function _showPendingScanRecoveryModal(chat, pending, count) {
 
     modal.querySelector('#horae-recover-keep').addEventListener('click', async () => {
         modal.remove();
-        delete chat[0].horae_meta._pendingScanReview;
+        clearPendingScanReview(chat);
         await getContext().saveChat();
         showToast(t('toast.summariesSaved', { n: count }), 'success');
         refreshAllDisplays();
@@ -19052,22 +19712,14 @@ function _showPendingScanRecoveryModal(chat, pending, count) {
     modal.querySelector('#horae-recover-discard').addEventListener('click', async () => {
         if (!confirm(t('confirm.discardScanReview'))) return;
         modal.remove();
-        for (const idx of pending.msgIndices) {
-            const meta = chat[idx]?.horae_meta;
-            if (!meta?._aiScanned) continue;
-            meta.events = [];
-            meta.items = {};
-            meta.npcs = {};
-            meta.affection = {};
-            if (meta.scene) meta.scene = {};
-            if (meta.relationships) meta.relationships = [];
-            delete meta._aiScanned;
-            injectHoraeTagToMessage(idx, meta);
+        let restoredCount = 0;
+        for (const idx of new Set(pending.msgIndices || [])) {
+            if (restoreAiScannedMessage(chat, idx)) restoredCount++;
         }
-        delete chat[0].horae_meta._pendingScanReview;
-        horaeManager.rebuildTableData();
+        clearPendingScanReview(chat);
+        rebuildAfterAiScanRestore();
         await getContext().saveChat();
-        showToast(t('toast.aiSummaryUndone', { n: count }), 'info');
+        showToast(t('toast.aiSummaryUndone', { n: restoredCount }), 'info');
         refreshAllDisplays();
         renderCustomTablesList();
     });
@@ -19169,7 +19821,29 @@ function showAIScanConfigDialog(targetCount) {
     });
 }
 
-/** 撤销AI摘要 — 清除所有 _aiScanned 标记的数据 */
+function restoreAiScannedMessage(chat, messageIndex) {
+    const message = chat?.[messageIndex];
+    const meta = message?.horae_meta;
+    if (!meta?._aiScanned) return false;
+
+    const restored = restoreAiScannedMeta(meta);
+    if (restored == null) {
+        delete message.horae_meta;
+        injectHoraeTagToMessage(messageIndex, createEmptyMeta());
+    } else {
+        horaeManager.setMessageMeta(messageIndex, restored);
+        injectHoraeTagToMessage(messageIndex, restored);
+    }
+    return true;
+}
+
+function rebuildAfterAiScanRestore() {
+    horaeManager.rebuildTableData();
+    horaeManager.rebuildRelationships();
+    horaeManager.rebuildLocationMemory();
+}
+
+/** 撤销AI摘要 — 恢复所有 _aiScanned 标记楼层的扫描前状态 */
 async function undoAIScan() {
     const chat = horaeManager.getChat();
     if (!chat || chat.length === 0) return;
@@ -19186,18 +19860,15 @@ async function undoAIScan() {
 
     if (!confirm(t('confirm.clearAiSummary', { n: count }))) return;
 
+    let restoredCount = 0;
     for (let i = 0; i < chat.length; i++) {
-        const meta = chat[i].horae_meta;
-        if (!meta?._aiScanned) continue;
-        meta.events = [];
-        meta.items = {};
-        delete meta._aiScanned;
-        horaeManager.setMessageMeta(i, meta);
+        if (restoreAiScannedMessage(chat, i)) restoredCount++;
     }
 
-    horaeManager.rebuildTableData();
+    clearPendingScanReview(chat);
+    rebuildAfterAiScanRestore();
     await getContext().saveChat();
-    showToast(t('toast.aiSummaryUndone', { n: count }), 'success');
+    showToast(t('toast.aiSummaryUndone', { n: restoredCount }), 'success');
     refreshAllDisplays();
     renderCustomTablesList();
 }
@@ -21012,9 +21683,7 @@ async function onPromptReady(eventData) {
         }
 
         // antiParaRef 紧贴 rulesPrompt 末尾，让 AI 把"上一条 USER 消息"和"反转述规则"看在一起
-        const combinedPrompt = recallPrompt
-            ? `${dataPrompt}\n${recallPrompt}\n${rulesPrompt}${antiParaRef}`
-            : `${dataPrompt}\n${rulesPrompt}${antiParaRef}`;
+        const combinedPrompt = composeHoraeInjectionPrompt(dataPrompt, recallPrompt, rulesPrompt, antiParaRef);
         const positionRaw = parseInt(settings.injectionPosition, 10);
         const position = Number.isNaN(positionRaw) ? 1 : Math.max(0, positionRaw);
         const depthSource = settings.injectionDepthSource === 'preset' ? 'preset' : 'system';

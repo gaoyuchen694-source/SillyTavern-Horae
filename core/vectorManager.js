@@ -303,7 +303,7 @@ export class VectorManager {
      * - 事件摘要为主权重，独立首段
      * - 时间/地点/在场角色作为锚点（区分 4/1 vs 6/3 同类事件、跨地点同类事件）
      * - 不写英文标签（[Event]/[NPC] 等对中文 embedding 是无意义低 IDF token）
-     * - 不写 NPC 外貌/性格/关系/服装/物品/情绪等高重复字段（IDF 噪声重灾区）
+     * - 记录计划、物品变化、关系与 NPC 身份，避免长期事实只能依赖事件摘要
      * - RPG 变更使用中文短句
      */
     buildVectorDocument(meta) {
@@ -312,7 +312,6 @@ export class VectorManager {
         const eventTexts = [];
         if (meta.events?.length > 0) {
             for (const evt of meta.events) {
-                if (evt.isSummary || evt.level === '摘要' || evt._summaryId) continue;
                 if (evt.summary) eventTexts.push(evt.summary);
             }
         }
@@ -348,11 +347,53 @@ export class VectorManager {
             }
         }
 
-        if (eventTexts.length === 0 && anchorTokens.length === 0 && rpgLines.length === 0) return '';
+        const memoryLines = [];
+        for (const agenda of (meta.agenda || [])) {
+            const text = agenda.text || agenda.title || '';
+            if (!text) continue;
+            const due = agenda.dueAt ? `，截止 ${agenda.dueAt}` : '';
+            const status = agenda.status ? `，状态 ${agenda.status}` : '';
+            memoryLines.push(`计划 ${text}${due}${status}`);
+        }
+        for (const transition of (meta.agendaLifecycle || [])) {
+            const target = transition.text || transition.title || transition.id || '';
+            if (!target) continue;
+            memoryLines.push(`计划变化 ${target} ${transition.status || transition.action || ''} ${transition.dueAt || ''}`.trim());
+        }
+        for (const text of (meta.deletedAgenda || [])) {
+            if (text) memoryLines.push(`计划结束 ${text}`);
+        }
+        for (const [name, info] of Object.entries(meta.items || {})) {
+            const holder = info.holder ? `，持有者 ${info.holder}` : '';
+            const location = info.location ? `，位置 ${info.location}` : '';
+            const description = info.description ? `，${info.description}` : '';
+            memoryLines.push(`物品 ${name}${holder}${location}${description}`);
+        }
+        for (const transition of (meta.itemLifecycle || [])) {
+            const target = transition.name || transition.id || '';
+            if (!target) continue;
+            const quantity = transition.delta !== undefined ? `数量变化 ${transition.delta}` : (transition.qty !== undefined ? `数量 ${transition.qty}` : '');
+            memoryLines.push(`物品变化 ${target} ${quantity} ${transition.status || transition.action || ''} ${transition.holder || ''} ${transition.location || ''}`.trim());
+        }
+        for (const name of (meta.deletedItems || [])) {
+            if (name) memoryLines.push(`物品离开清单 ${name}`);
+        }
+        for (const [name, info] of Object.entries(meta.npcs || {})) {
+            const identity = [info.gender, info.age, info.race, info.job].filter(Boolean).join(' ');
+            const relation = info.relationship ? `，关系 ${info.relationship}` : '';
+            const description = info.description || info.note || '';
+            memoryLines.push(`人物 ${name}${identity ? `，${identity}` : ''}${relation}${description ? `，${description}` : ''}`);
+        }
+        for (const rel of (meta.relationships || [])) {
+            if (rel.from && rel.to && rel.type) memoryLines.push(`关系 ${rel.from} 与 ${rel.to}：${rel.type}${rel.note ? `，${rel.note}` : ''}`);
+        }
+
+        if (eventTexts.length === 0 && anchorTokens.length === 0 && rpgLines.length === 0 && memoryLines.length === 0) return '';
 
         const blocks = [];
         if (eventTexts.length > 0) blocks.push(eventTexts.join('\n'));
         if (anchorTokens.length > 0) blocks.push(anchorTokens.join(' '));
+        if (memoryLines.length > 0) blocks.push([...new Set(memoryLines)].join('\n'));
         if (rpgLines.length > 0) blocks.push(rpgLines.join('\n'));
 
         return blocks.join('\n\n');
@@ -722,22 +763,34 @@ export class VectorManager {
         const EXCLUDE_RECENT = 5;
         const effectiveEnd = Math.max(0, chat.length - Math.max(0, skipLast));
         const excludeIndices = new Set();
-        // 所有未隐藏的 AI 楼层默认视为「prompt 内已可见」，避免召回与正文重复
-        // is_hidden=true 的楼层 ST 不会发送，仍允许被召回作为历史记忆
-        let visibleExcludedCount = 0;
-        for (let i = 0; i < effectiveEnd; i++) {
-            const msg = chat[i];
-            if (!msg || msg.is_user || msg.is_hidden) continue;
-            if (!msg.horae_meta || msg.horae_meta._skipHorae) continue;
-            excludeIndices.add(i);
-            visibleExcludedCount++;
-        }
+        // ST 会裁剪较早的可见消息；只有调用方确认仍在实际 Prompt 中的楼层才能排除。
+        // 另保留一个很小的近期窗口，防止刚发生的内容重复召回。
         for (let i = Math.max(0, effectiveEnd - EXCLUDE_RECENT); i < effectiveEnd; i++) {
             excludeIndices.add(i);
         }
         // skipLast 区间（swipe 中的尾部楼层）一并排除，避免召回到上一次 swipe 的内容
         for (let i = effectiveEnd; i < chat.length; i++) {
             excludeIndices.add(i);
+        }
+        // 当前剧情日由紧凑提示词中的“同日权威账本”完整承载。
+        // 这里排除对应的当前聊天楼层，避免上午事件在下午又以向量回忆重复注入；
+        // 已挂载的历史快照不使用聊天索引，因此仍可正常参与跨日召回。
+        let sameDayExcludedCount = 0;
+        if (settings?.sendSameDayMemory !== false) {
+            try {
+                const sameDayEntries = horaeManager.getMemoryState(skipLast)?.sameDay || [];
+                for (const entry of sameDayEntries) {
+                    const idx = this._normalizeMessageIndex(entry?.messageIndex);
+                    if (idx === null || idx < 0 || idx >= effectiveEnd) continue;
+                    if (!excludeIndices.has(idx)) sameDayExcludedCount++;
+                    excludeIndices.add(idx);
+                }
+            } catch (err) {
+                this._debug(`[Horae Vector] 读取同日权威账本失败，保留默认召回排除规则：${err?.message || err}`);
+            }
+        }
+        if (sameDayExcludedCount > 0) {
+            this._debug(`[Horae Vector] 同日权威账本已覆盖，排除向量重复楼层: ${sameDayExcludedCount} 条`);
         }
         let extraPromptExcludedCount = 0;
         if (extraExcludeIndices && typeof extraExcludeIndices[Symbol.iterator] === 'function') {
@@ -748,11 +801,8 @@ export class VectorManager {
                 }
             }
         }
-        if (visibleExcludedCount > 0) {
-            this._debug(`[Horae Vector] 排除未隐藏 AI 楼层: ${visibleExcludedCount} 条`);
-        }
         if (extraPromptExcludedCount > 0) {
-            this._debug(`[Horae Vector] 额外排除已在 Prompt 中的楼层: ${extraPromptExcludedCount}`);
+            this._debug(`[Horae Vector] 排除实际仍在 Prompt 中的楼层: ${extraPromptExcludedCount} 条`);
         }
 
         const pureMode = !!settings.vectorPureMode;
@@ -1608,7 +1658,6 @@ export class VectorManager {
         const parts = [];
         if (meta.events) {
             for (const evt of meta.events) {
-                if (evt.isSummary || evt.level === '摘要' || evt._summaryId) continue;
                 if (evt.summary) parts.push(evt.summary);
             }
         }
@@ -1616,14 +1665,38 @@ export class VectorManager {
         if (meta.npcs) {
             for (const [name, info] of Object.entries(meta.npcs)) {
                 parts.push(name);
-                if (info.description) parts.push(info.description);
+                for (const value of [info.description, info.appearance, info.personality, info.relationship, info.job, info.note]) {
+                    if (value) parts.push(value);
+                }
             }
         }
         if (meta.items) {
             for (const [name, info] of Object.entries(meta.items)) {
                 parts.push(name);
-                if (info.location) parts.push(info.location);
+                for (const value of [info.holder, info.location, info.description, info.status, info.kind]) {
+                    if (value) parts.push(String(value));
+                }
             }
+        }
+        for (const item of (meta.itemLifecycle || [])) {
+            for (const value of [item.id, item.name, item.status, item.holder, item.location, item.reason]) {
+                if (value !== undefined && value !== '') parts.push(String(value));
+            }
+        }
+        for (const agenda of (meta.agenda || [])) {
+            for (const value of [agenda.text, agenda.title, agenda.date, agenda.dueAt, agenda.status]) {
+                if (value) parts.push(String(value));
+            }
+        }
+        for (const agenda of (meta.agendaLifecycle || [])) {
+            for (const value of [agenda.id, agenda.text, agenda.title, agenda.dueAt, agenda.status, agenda.reason, agenda.evidence]) {
+                if (value) parts.push(String(value));
+            }
+        }
+        for (const value of (meta.deletedItems || [])) if (value) parts.push(String(value));
+        for (const value of (meta.deletedAgenda || [])) if (value) parts.push(String(value));
+        for (const rel of (meta.relationships || [])) {
+            for (const value of [rel.from, rel.to, rel.type, rel.note]) if (value) parts.push(String(value));
         }
         return parts.join(' ');
     }

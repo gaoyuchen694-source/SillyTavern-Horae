@@ -1,8 +1,8 @@
-# Horae v1.15.1 - Memory Engine for SillyTavern
+# Horae v1.17.0 - Memory Engine for SillyTavern
 
 **English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
-![Image](https://github.com/SenriYuki/SillyTavern-Horae/blob/main/HoraeLogo.jpg)
+![Image](https://github.com/gaoyuchen694-source/SillyTavern-Horae/blob/main/HoraeLogo.jpg)
 
 > *Horae — Greek goddesses who governed the orderly progression of time*
 
@@ -16,11 +16,14 @@ Long-form RP players know the pain: AI memory is basically a goldfish. Yesterday
 
 ### Core Memory System
 
+- **Authoritative Same-Day Memory** — Every valid event from the current story day is always retained in the injected memory ledger, so an afternoon scene still remembers what happened that morning.
+- **Mainline Story Clock** — Flashbacks are isolated from the main clock. Unsupported time reversals are blocked and surfaced as anomalies.
 - **Timeline Tracking** — Events are timestamped with relative time calculations ("yesterday", "last Wednesday", "2 months ago"). AI finally knows the difference.
 - **Costume Lock** — Each character's current outfit is recorded and only sent for present characters. No more phantom wardrobe changes.
 - **NPC Tracking** — Appearance, personality, relationships tracked independently. Ages advance with story time. Relationship prompts are strictly enforced.
-- **Item Inventory** — Unique ID system with Normal / Important / Critical tiers. Smart quantity parsing, auto-detection of consumed items.
-- **Agenda** — AI automatically records plot promises and deadlines. Completed items are auto-removed.
+- **Item Inventory** — Stable IDs, quantities, transfers, consumption, expiry, and per-day decay. Manual edits and deletions survive history rescans.
+- **Agenda** — Plot promises and deadlines can complete, cancel, become overdue, or archive instead of accumulating forever. `dueAt` is only the planned/due time: future plans remain pending across day changes, and overdue plans stay active until explicit completion, cancellation, or expiry.
+- **Story Calendar** — Browse events, plan deadlines, item changes, and time anomalies by Gregorian, custom-calendar, or free-form fantasy dates.
 - **Mood & Relationships** — Emotion tracking keeps characters consistent. Relationship network records bonds between characters. Both are change-driven: zero output when nothing changes.
 - **Scene Memory** — Records fixed physical features of locations for consistent descriptions across visits.
 
@@ -57,10 +60,18 @@ Long-form RP players know the pain: AI memory is basically a goldfish. Yesterday
 ## Installation
 
 1. Open SillyTavern → Extensions panel (puzzle icon) → **Install Extension**
-2. Paste this repository's Git URL and click Install
+2. Paste `https://github.com/gaoyuchen694-source/SillyTavern-Horae.git` and click Install
 3. Refresh the page — done!
 
 > The companion regex is **auto-injected** on first load. No manual import needed.
+
+---
+
+## Upgrading from Original Horae
+
+Existing Horae chats work directly with this enhanced build. Install this repository in place of the original extension, refresh SillyTavern, and reopen the same chat. Existing `horae_meta`, `item`, `item-`, `agenda`, and `agenda-` records are replayed automatically by the new memory engine; no export, migration button, or full-history rescan is required.
+
+Back up important chats before replacing any extension. The enhanced build keeps the original extension folder and data formats for compatibility, so do not run the original and enhanced repositories as duplicate installations at the same time.
 
 ---
 
@@ -89,7 +100,7 @@ window.Horae?.getEvents(10)      // → last 10 events
 window.Horae?.getSettings()
 
 // Version string
-window.Horae?.version            // → "1.14.0"
+window.Horae?.version            // → "1.17.0"
 ```
 
 Settings change events are broadcast via SillyTavern's `eventSource`:
@@ -117,19 +128,20 @@ eventSource.on('horae:settingsChanged', (data) => {
 | Русский (Russian)          | ✅ Full |
 
 
-**Want Horae in your language?** Open an [Issue](https://github.com/SenriYuki/SillyTavern-Horae/issues) or submit a PR with a translation file! See `locales/en.json` for the translation template.
+**Want Horae in your language?** Open an [Issue](https://github.com/gaoyuchen694-source/SillyTavern-Horae/issues) or submit a PR with a translation file! See `locales/en.json` for the translation template.
 
 ---
 
-## What's New in v1.14.0
+## What's New in v1.17.0
 
-### Auxiliary API
+### Memory, Time, and Lifecycles
 
-- New standalone **Auxiliary API** settings section for OpenAI-compatible endpoints.
-- Choose where to use it: AI analysis / magic wand / pre-send timeline fill, auto-summary + AI smart enrich, or manual multi-select compression.
-- Auxiliary API requests run through a serial queue to reduce endpoint 429s.
-- Fallback to the main API is available but off by default.
-- API URL, key, and model are excluded from Horae config profile exports.
+- Current-day events now form an authoritative memory ledger independent of normal timeline depth, summary hiding, and vector thresholds.
+- Long-term vector documents include plan, item, NPC identity, and relationship facts from hidden and visible history.
+- The mainline story clock isolates flashbacks and flags unsupported time reversals.
+- Plans and items have replayable lifecycles: completion, cancellation, overdue status, archive, quantity changes, transfer, consumption, expiry, and daily decay. A future plan is not completed or removed merely because the story advances to the next day.
+- The new story calendar and memory-health panel make dates, anomalies, and lifecycle state inspectable.
+- Original Horae `item`, `item-`, `agenda`, and `agenda-` data works directly without migration.
 
 See [CHANGELOG](CHANGELOG.md) for full version history.
 
@@ -140,6 +152,8 @@ Bug reports and suggestions are welcome!
 > ⚠️ This is a side project — replies may be delayed. Thank you for your patience.
 
 **Author: SenriYuki**
+
+**Enhanced build maintained by: [@gaoyuchen694-source](https://github.com/gaoyuchen694-source)**
 
 ### Translation Credits
 
@@ -154,4 +168,3 @@ Bug reports and suggestions are welcome!
 ### Buy me a boba?
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/B8B620XPCL)
-

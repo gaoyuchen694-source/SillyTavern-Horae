@@ -10,7 +10,7 @@
                 <i class="fa-regular fa-clock"></i>
                 Horae 时光记忆
             </div>
-            <span class="horae-version">1.15.1</span>
+            <span class="horae-version">1.17.0</span>
         </div>
         
         <!-- 标签页导航 -->
@@ -58,6 +58,12 @@
                         <span id="horae-current-date">--/--</span>
                         <span id="horae-current-time">--:--</span>
                     </div>
+                    <div id="horae-memory-health" class="horae-memory-health">
+                        <span id="horae-clock-confidence" class="horae-health-metric"></span>
+                        <span id="horae-agenda-health" class="horae-health-metric"></span>
+                        <span id="horae-item-health" class="horae-health-metric"></span>
+                    </div>
+                    <div id="horae-clock-anomaly" class="horae-clock-anomaly" hidden></div>
                 </div>
                 
                 <div class="horae-state-section">
@@ -133,59 +139,93 @@
                     </div>
                 </div>
                 
+                <div class="horae-timeline-view-switch" role="tablist" data-i18n-label="timeline.viewSwitch">
+                    <button id="horae-view-calendar" class="horae-segment-btn active" type="button" role="tab" aria-selected="true" aria-controls="horae-calendar-view" tabindex="0" data-timeline-view="calendar">
+                        <i class="fa-regular fa-calendar-days"></i>
+                        <span data-i18n="timeline.calendar">日历</span>
+                    </button>
+                    <button id="horae-view-events" class="horae-segment-btn" type="button" role="tab" aria-selected="false" aria-controls="horae-events-view" tabindex="-1" data-timeline-view="events">
+                        <i class="fa-solid fa-timeline"></i>
+                        <span data-i18n="timeline.eventsShort">事件</span>
+                    </button>
+                </div>
+
+                <!-- 叙事日历区域 -->
+                <div id="horae-calendar-view" class="horae-timeline-view active" role="tabpanel" aria-labelledby="horae-view-calendar">
+                    <div class="horae-calendar-nav">
+                        <button id="horae-calendar-prev" class="horae-calendar-nav-btn" type="button" data-i18n-title="tooltip.previousPeriod" data-i18n-label="tooltip.previousPeriod" title="" aria-label="Previous period">
+                            <i class="fa-solid fa-chevron-left"></i>
+                        </button>
+                        <div id="horae-calendar-period" class="horae-calendar-period">--</div>
+                        <button id="horae-calendar-today" class="horae-calendar-today" type="button" data-i18n-title="tooltip.currentStoryDate" title="">
+                            <i class="fa-solid fa-location-crosshairs"></i>
+                            <span data-i18n="timeline.currentStoryDate">当前剧情日</span>
+                        </button>
+                        <button id="horae-calendar-next" class="horae-calendar-nav-btn" type="button" data-i18n-title="tooltip.nextPeriod" data-i18n-label="tooltip.nextPeriod" title="" aria-label="Next period">
+                            <i class="fa-solid fa-chevron-right"></i>
+                        </button>
+                    </div>
+                    <div id="horae-calendar-weekdays" class="horae-calendar-weekdays"></div>
+                    <div id="horae-calendar-grid" class="horae-calendar-grid"></div>
+                    <div id="horae-calendar-list" class="horae-calendar-list"></div>
+                    <div id="horae-calendar-detail" class="horae-calendar-detail"></div>
+                </div>
+
                 <!-- 事件时间线区域 -->
-                <div class="horae-timeline-header">
-                    <span data-i18n="timeline.events">事件时间线</span>
-                    <div class="horae-timeline-controls">
-                        <select id="horae-timeline-filter" class="horae-select" data-i18n-title="tooltip.filterLevel" title="">
-                            <option value="all" data-i18n="timeline.filterAll">全部</option>
-                            <option value="关键" data-i18n="timeline.filterCritical">关键</option>
-                            <option value="重要" data-i18n="timeline.filterImportant">重要</option>
-                            <option value="一般" data-i18n="timeline.filterNormal">一般</option>
-                            <option value="摘要" data-i18n="timeline.filterSummary">总结</option>
-                        </select>
-                        <button id="horae-btn-timeline-multiselect" class="horae-icon-btn" data-i18n-title="tooltip.multiSelectMode" title="">
-                            <i class="fa-solid fa-check-double"></i>
-                        </button>
-                        <button id="horae-btn-fix-summaries" class="horae-icon-btn" data-i18n-title="tooltip.fixSummaries" title="">
-                            <i class="fa-solid fa-screwdriver-wrench"></i>
-                        </button>
-                        <button id="horae-btn-auto-summary-now" class="horae-icon-btn" data-i18n-title="tooltip.autoSummaryNow" title="">
-                            <i class="fa-solid fa-bolt"></i>
-                        </button>
-                        <button id="horae-btn-scan-all" class="horae-icon-btn" data-i18n-title="tooltip.refreshTimeline" title="">
-                            <i class="fa-solid fa-rotate"></i>
-                        </button>
+                <div id="horae-events-view" class="horae-timeline-view" role="tabpanel" aria-labelledby="horae-view-events" hidden>
+                    <div class="horae-timeline-header">
+                        <span data-i18n="timeline.events">事件时间线</span>
+                        <div class="horae-timeline-controls">
+                            <select id="horae-timeline-filter" class="horae-select" data-i18n-title="tooltip.filterLevel" title="">
+                                <option value="all" data-i18n="timeline.filterAll">全部</option>
+                                <option value="关键" data-i18n="timeline.filterCritical">关键</option>
+                                <option value="重要" data-i18n="timeline.filterImportant">重要</option>
+                                <option value="一般" data-i18n="timeline.filterNormal">一般</option>
+                                <option value="摘要" data-i18n="timeline.filterSummary">总结</option>
+                            </select>
+                            <button id="horae-btn-timeline-multiselect" class="horae-icon-btn" data-i18n-title="tooltip.multiSelectMode" title="">
+                                <i class="fa-solid fa-check-double"></i>
+                            </button>
+                            <button id="horae-btn-fix-summaries" class="horae-icon-btn" data-i18n-title="tooltip.fixSummaries" title="">
+                                <i class="fa-solid fa-screwdriver-wrench"></i>
+                            </button>
+                            <button id="horae-btn-auto-summary-now" class="horae-icon-btn" data-i18n-title="tooltip.autoSummaryNow" title="">
+                                <i class="fa-solid fa-bolt"></i>
+                            </button>
+                            <button id="horae-btn-scan-all" class="horae-icon-btn" data-i18n-title="tooltip.refreshTimeline" title="">
+                                <i class="fa-solid fa-rotate"></i>
+                            </button>
+                        </div>
                     </div>
-                </div>
-                <div class="horae-timeline-search-row">
-                    <i class="fa-solid fa-magnifying-glass horae-search-icon"></i>
-                    <input type="text" id="horae-timeline-search" class="horae-search-input" data-i18n="[placeholder]timeline.searchPlaceholder" placeholder="搜索事件关键字...">
-                </div>
-                <!-- 时间线多选模式工具栏 -->
-                <div id="horae-timeline-multiselect-bar" class="horae-multiselect-bar" style="display: none;">
-                    <div class="horae-multiselect-info">
-                        <span id="horae-timeline-selected-count">0</span> 项已选
+                    <div class="horae-timeline-search-row">
+                        <i class="fa-solid fa-magnifying-glass horae-search-icon"></i>
+                        <input type="text" id="horae-timeline-search" class="horae-search-input" data-i18n="[placeholder]timeline.searchPlaceholder" placeholder="搜索事件关键字...">
                     </div>
-                    <div class="horae-multiselect-actions">
-                        <button id="horae-btn-timeline-select-all" class="horae-icon-btn small" data-i18n-title="tooltip.selectAll" title="">
-                            <i class="fa-solid fa-check-double"></i>
-                        </button>
-                        <button id="horae-btn-timeline-compress" class="horae-icon-btn small" data-i18n-title="tooltip.aiCompress" title="">
-                            <i class="fa-solid fa-compress"></i>
-                        </button>
-                        <button id="horae-btn-timeline-delete" class="horae-icon-btn small danger" data-i18n-title="tooltip.deleteSelected" title="">
-                            <i class="fa-solid fa-trash-can"></i>
-                        </button>
-                        <button id="horae-btn-timeline-cancel-select" class="horae-icon-btn small" data-i18n-title="tooltip.cancelMultiSelect" title="">
-                            <i class="fa-solid fa-xmark"></i>
-                        </button>
+                    <!-- 时间线多选模式工具栏 -->
+                    <div id="horae-timeline-multiselect-bar" class="horae-multiselect-bar" style="display: none;">
+                        <div class="horae-multiselect-info">
+                            <span id="horae-timeline-selected-count">0</span> 项已选
+                        </div>
+                        <div class="horae-multiselect-actions">
+                            <button id="horae-btn-timeline-select-all" class="horae-icon-btn small" data-i18n-title="tooltip.selectAll" title="">
+                                <i class="fa-solid fa-check-double"></i>
+                            </button>
+                            <button id="horae-btn-timeline-compress" class="horae-icon-btn small" data-i18n-title="tooltip.aiCompress" title="">
+                                <i class="fa-solid fa-compress"></i>
+                            </button>
+                            <button id="horae-btn-timeline-delete" class="horae-icon-btn small danger" data-i18n-title="tooltip.deleteSelected" title="">
+                                <i class="fa-solid fa-trash-can"></i>
+                            </button>
+                            <button id="horae-btn-timeline-cancel-select" class="horae-icon-btn small" data-i18n-title="tooltip.cancelMultiSelect" title="">
+                                <i class="fa-solid fa-xmark"></i>
+                            </button>
+                        </div>
                     </div>
-                </div>
-                <div id="horae-timeline-list" class="horae-timeline-list">
-                    <div class="horae-empty-state">
-                        <i class="fa-regular fa-clock"></i>
-                        <span data-i18n="timeline.noEvents">暂无记录的事件</span>
+                    <div id="horae-timeline-list" class="horae-timeline-list">
+                        <div class="horae-empty-state">
+                            <i class="fa-regular fa-clock"></i>
+                            <span data-i18n="timeline.noEvents">暂无记录的事件</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -897,6 +937,14 @@
                         </label>
                         <span class="horae-setting-sub-hint" data-i18n="settings.sendTimelineHint">历史事件总结、相对时间计算。关闭后AI无法知道"几天前"发生了什么。</span>
                     </div>
+
+                    <div class="horae-setting-item">
+                        <label data-i18n="settings.sendSameDayMemory">
+                            <input type="checkbox" id="horae-setting-send-same-day-memory" checked>
+                            当日权威记忆
+                        </label>
+                        <span class="horae-setting-sub-hint" data-i18n="settings.sendSameDayMemoryHint">完整发送当前剧情日的所有事件，不受上下文深度和向量相似度影响，避免下午忘记上午。建议保持开启。</span>
+                    </div>
                     
                     <div class="horae-setting-item">
                         <label data-i18n="settings.sendCharacters">
@@ -926,6 +974,14 @@
                             物品栏
                         </label>
                         <span class="horae-setting-sub-hint" data-i18n="settings.sendItemsHint">当前持有的物品及位置。关闭后AI可能"凭空"取出不存在的物品。</span>
+                    </div>
+
+                    <div class="horae-setting-item">
+                        <label data-i18n="settings.sendAgenda">
+                            <input type="checkbox" id="horae-setting-send-agenda" checked>
+                            活跃计划
+                        </label>
+                        <span class="horae-setting-sub-hint" data-i18n="settings.sendAgendaHint">发送所有待执行、进行中和逾期计划及截止时间。跨日不会清除未来计划。</span>
                     </div>
 
                     <div class="horae-setting-item">
@@ -1042,7 +1098,7 @@
                             <input type="checkbox" id="horae-setting-anti-paraphrase">
                             反转述模式
                         </label>
-                        <span class="horae-setting-sub-hint" data-i18n="settings.antiParaphraseHint">适用于「USER自己描写行为/动作，AI不再转述USER部分」的写法。开启后，AI回复时会将上一条USER消息的内容也纳入本条<horae>标签的结算，确保USER的行为不遗漏。</span>
+                        <span class="horae-setting-sub-hint" data-i18n="settings.antiParaphraseHint">适用于「USER自己描写行为/动作，AI不再转述USER部分」的写法。开启后，AI回复时会将上一条USER消息的内容也纳入本条&lt;horae&gt;标签的结算，确保USER的行为不遗漏。</span>
                     </div>
                     <div class="horae-setting-item">
                         <label data-i18n="settings.sideplayMode">
@@ -1711,7 +1767,7 @@
                 </div>
 
                 <div class="horae-about">
-                    <p>Horae v1.15.1 | 作者: SenriYuki</p>
+                    <p>Horae v1.17.0 | 作者: SenriYuki</p>
                     <p>基于时间锚点的AI记忆增强系统</p>
                 </div>
             </div>
