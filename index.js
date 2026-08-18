@@ -3,7 +3,7 @@
  * 基于时间锚点的AI记忆增强系统
  * 
  * 作者: SenriYuki
- * 版本: 1.17.0
+ * 版本: 1.17.1
  */
 
 import { renderExtensionTemplateAsync, getContext, extension_settings } from '/scripts/extensions.js';
@@ -28,7 +28,7 @@ import { initPromptDefaults, ensurePromptDefaults, ensurePresetPrompts, getPromp
 const EXTENSION_NAME = 'horae';
 const EXTENSION_FOLDER = `third-party/SillyTavern-Horae`;
 const TEMPLATE_PATH = `${EXTENSION_FOLDER}/assets/templates`;
-const VERSION = '1.17.0';
+const VERSION = '1.17.1';
 
 // settings 来源标记。仅用于区分「上次写入是否本版本自身」，外部来源（旧版本/其他分发版）会触发一次确认弹窗
 const ENGINE_TAG = 'horae-official';
@@ -362,6 +362,7 @@ let timelineLongPressTimer = null;  // 时间线长按计时器
 let timelineViewMode = 'calendar';  // 时间线页内部视图
 let calendarCursor = null;          // 当前浏览的剧情月份（不改变故事时钟）
 let selectedCalendarDayKey = '';
+const expandedCalendarEventDays = new Set();
 const _hideUnhideDebugStats = {
     hide: 0,
     unhide: 0,
@@ -2259,6 +2260,7 @@ function calendarDayInPeriod(day, cursor) {
 function getCalendarDayRecordCount(day) {
     return (day?.events?.length || 0) + (day?.agendaChanges?.length || 0)
         + (day?.agendaDue?.length || 0) + (day?.itemChanges?.length || 0)
+        + (day?.locationChanges?.length || 0) + (day?.relationshipChanges?.length || 0)
         + (day?.anomalies?.length || 0);
 }
 
@@ -2269,6 +2271,8 @@ function renderCalendarMarkers(day) {
     if (overdue) markers.push(`<span class="overdue" title="${escapeHtml(t('lifecycle.overdue'))}"></span>`);
     else if ((day.agendaChanges?.length || 0) + (day.agendaDue?.length || 0) > 0) markers.push(`<span class="agenda" title="${escapeHtml(t('timeline.agendaChanges'))}"></span>`);
     if (day.itemChanges?.length) markers.push(`<span class="items" title="${escapeHtml(t('timeline.itemChanges'))}"></span>`);
+    if (day.locationChanges?.length) markers.push(`<span class="locations" title="${escapeHtml(t('timeline.locationChanges'))}"></span>`);
+    if (day.relationshipChanges?.length) markers.push(`<span class="relationships" title="${escapeHtml(t('timeline.relationshipChanges'))}"></span>`);
     if (day.anomalies?.length) markers.push(`<span class="anomaly" title="${escapeHtml(t('timeline.timeAnomalies'))}"></span>`);
     return `<span class="horae-calendar-day-markers">${markers.join('')}</span>`;
 }
@@ -2296,14 +2300,35 @@ function updateCalendarDetail(day) {
 
     const sections = [];
     if (day.events?.length) {
+        const featuredEvents = Array.isArray(day.featuredEvents) ? day.featuredEvents : day.events;
+        const otherEvents = Array.isArray(day.otherEvents) ? day.otherEvents : [];
+        const expanded = expandedCalendarEventDays.has(day.key);
+        const renderEvent = event => {
+            const priority = event.priority === 'critical' || event.priority === 'important'
+                ? `<span class="horae-calendar-priority ${escapeHtml(event.priority)}">${escapeHtml(t(event.priority === 'critical' ? 'timeline.filterCritical' : 'timeline.filterImportant'))}</span>`
+                : '';
+            return `
+                <button type="button" class="horae-calendar-record event ${escapeHtml(event.priority || 'normal')}" data-calendar-message="${Number(event.messageIndex)}">
+                    <span class="horae-calendar-event-meta">
+                        <span class="horae-calendar-record-time">${escapeHtml(event.time || '')}</span>
+                        ${priority}
+                    </span>
+                    <span>${escapeHtml(event.summary)}</span>
+                </button>`;
+        };
         sections.push(`
             <section class="horae-calendar-detail-section">
-                <h4><i class="fa-solid fa-timeline"></i>${escapeHtml(t('timeline.eventsCount', { n: day.events.length }))}</h4>
-                ${day.events.map(event => `
-                    <button type="button" class="horae-calendar-record" data-calendar-message="${Number(event.messageIndex)}">
-                        <span class="horae-calendar-record-time">${escapeHtml(event.time || '')}</span>
-                        <span>${escapeHtml(event.summary)}</span>
-                    </button>`).join('')}
+                <h4><i class="fa-solid fa-timeline"></i>${escapeHtml(t('timeline.keyEvents'))}</h4>
+                ${featuredEvents.map(renderEvent).join('')}
+                ${otherEvents.length ? `
+                    <div id="horae-calendar-other-events" class="horae-calendar-other-events"${expanded ? '' : ' hidden'}>
+                        ${otherEvents.map(renderEvent).join('')}
+                    </div>
+                    <button type="button" class="horae-calendar-disclosure" data-calendar-events-toggle="${escapeHtml(day.key)}"
+                            aria-expanded="${String(expanded)}" aria-controls="horae-calendar-other-events">
+                        <i class="fa-solid fa-chevron-${expanded ? 'up' : 'down'}" aria-hidden="true"></i>
+                        <span>${escapeHtml(t(expanded ? 'timeline.hideMoreEvents' : 'timeline.showMoreEvents', { n: otherEvents.length }))}</span>
+                    </button>` : ''}
             </section>`);
     }
     if (day.agendaChanges?.length || day.agendaDue?.length) {
@@ -2341,6 +2366,30 @@ function updateCalendarDetail(day) {
                 }).join('')}
             </section>`);
     }
+    if (day.locationChanges?.length) {
+        sections.push(`
+            <section class="horae-calendar-detail-section">
+                <h4><i class="fa-solid fa-location-dot"></i>${escapeHtml(t('timeline.locationChanges'))}</h4>
+                ${day.locationChanges.map(location => `
+                    <button type="button" class="horae-calendar-record location" data-calendar-message="${Number(location.messageIndex)}">
+                        <span class="horae-calendar-record-time">${escapeHtml(location.time || '')}</span>
+                        <span>${escapeHtml(location.from
+                            ? `${location.from} → ${location.to}`
+                            : t('timeline.locationArrival', { location: location.to }))}</span>
+                    </button>`).join('')}
+            </section>`);
+    }
+    if (day.relationshipChanges?.length) {
+        sections.push(`
+            <section class="horae-calendar-detail-section">
+                <h4><i class="fa-solid fa-people-arrows"></i>${escapeHtml(t('timeline.relationshipChanges'))}</h4>
+                ${day.relationshipChanges.map(relationship => `
+                    <button type="button" class="horae-calendar-record relationship" data-calendar-message="${Number(relationship.messageIndex)}">
+                        <span class="horae-calendar-action relationships">${escapeHtml(formatCalendarAction(relationship.action))}</span>
+                        <span>${escapeHtml(`${relationship.from} → ${relationship.to}: ${relationship.type}${relationship.note ? ` · ${relationship.note}` : ''}`)}</span>
+                    </button>`).join('')}
+            </section>`);
+    }
     if (day.anomalies?.length) {
         sections.push(`
             <section class="horae-calendar-detail-section anomaly">
@@ -2359,6 +2408,12 @@ function updateCalendarDetail(day) {
         ${sections.join('') || `<div class="horae-calendar-detail-empty">${escapeHtml(t('timeline.noDayRecords'))}</div>`}`;
     detailEl.querySelectorAll('[data-calendar-message]').forEach(button => {
         button.addEventListener('click', () => scrollToMessage(button.dataset.calendarMessage));
+    });
+    detailEl.querySelector('[data-calendar-events-toggle]')?.addEventListener('click', button => {
+        const key = button.currentTarget.dataset.calendarEventsToggle;
+        if (expandedCalendarEventDays.has(key)) expandedCalendarEventDays.delete(key);
+        else expandedCalendarEventDays.add(key);
+        updateCalendarDetail(day);
     });
 }
 
@@ -2414,7 +2469,7 @@ function updateCalendarDisplay() {
             <button type="button" class="horae-calendar-list-day${day.current ? ' current' : ''}${day.key === selectedCalendarDayKey ? ' selected' : ''}"
                     data-calendar-day="${escapeHtml(day.key)}" aria-selected="${day.key === selectedCalendarDayKey}">
                 <span class="horae-calendar-list-date">${escapeHtml(day.displayDate || day.date)}</span>
-                <span class="horae-calendar-list-summary">${escapeHtml(day.events?.[0]?.summary || t('timeline.noDayRecords'))}</span>
+                <span class="horae-calendar-list-summary">${escapeHtml(day.featuredEvents?.[0]?.summary || day.events?.[0]?.summary || t('timeline.noDayRecords'))}</span>
                 ${renderCalendarMarkers(day)}
             </button>`).join('');
         if (!days.some(day => day.key === selectedCalendarDayKey)) {

@@ -5,6 +5,7 @@ import {
     buildSameDayLedger,
     buildStoryCalendar,
     buildStoryClock,
+    isCalendarSummaryEvent,
     parseMemoryProtocolLine,
     replayAgendaLifecycle,
     replayItemLifecycle,
@@ -860,6 +861,141 @@ test('叙事日历按主线日期聚合事件、计划和物品变化', () => {
     assert.equal(calendar.days[0].lastTime, '16:00');
     assert.equal(calendar.days[0].current, true);
     assert.doesNotMatch(calendar.days[0].events.map(event => event.summary).join(' '), /六年前/);
+});
+
+test('日历识别总结与跨段回顾标记，普通事件不受影响', () => {
+    assert.equal(isCalendarSummaryEvent({ isSummary: true }), true);
+    assert.equal(isCalendarSummaryEvent({ level: '摘要L1' }), true);
+    assert.equal(isCalendarSummaryEvent({ level: 'Summary L2' }), true);
+    assert.equal(isCalendarSummaryEvent({ _summaryId: 'S-1' }), true);
+    assert.equal(isCalendarSummaryEvent({ _carryoverSeed: true }), true);
+    assert.equal(isCalendarSummaryEvent({ level: '回顾' }), true);
+    assert.equal(isCalendarSummaryEvent({ level: '关键', summary: '真实发生的事件' }), false);
+});
+
+test('日历排除总结和活跃压缩覆盖的原事件，但不改动事件时间线来源数据', () => {
+    const chat = [message({ date: '2026/2/4', time: '09:00' })];
+    chat[0].horae_meta.events = [
+        { level: '关键', summary: '林夏取得港口仓库的钥匙。', _compressedBy: 'S-ACTIVE' },
+        { level: '摘要L1', summary: '林夏完成了上午的仓库调查。', isSummary: true, _summaryId: 'S-ACTIVE' },
+        { level: '一般', summary: '跨段记忆回顾。', _carryoverSeed: true },
+    ];
+    chat[0].horae_meta.autoSummaries = [{
+        id: 'S-ACTIVE',
+        active: true,
+        coveredIndices: [0],
+        summaryText: '林夏完成了上午的仓库调查。',
+    }];
+    const original = structuredClone(chat);
+
+    const calendar = buildStoryCalendar(chat);
+
+    assert.equal(calendar.days[0].events.length, 0);
+    assert.equal(chat[0].horae_meta.events.length, 3);
+    assert.equal(chat[0].horae_meta.events.some(event => event.isSummary), true);
+    assert.deepEqual(chat, original);
+});
+
+test('事件时间线数据仍保留总结，只有日历排除总结', () => {
+    const chat = [message({ date: '2026/2/4', time: '09:00' })];
+    chat[0].horae_meta.events = [
+        { level: '一般', summary: '林夏在港口寻找仓库。' },
+        { level: '摘要', summary: '林夏完成了港口调查。', isSummary: true, _summaryId: 'S-TIMELINE' },
+    ];
+    const oldContext = horaeManager.context;
+    const oldSettings = horaeManager.settings;
+
+    try {
+        horaeManager.init({ chat, name1: '林夏', name2: '艾伦' }, {});
+        const timelineEvents = horaeManager.getEvents();
+        const calendarEvents = buildStoryCalendar(chat).days[0].events;
+
+        assert.equal(timelineEvents.length, 2);
+        assert.equal(timelineEvents.some(entry => entry.event.isSummary), true);
+        assert.equal(calendarEvents.length, 1);
+        assert.equal(calendarEvents.some(event => event.summary.includes('完成了港口调查')), false);
+    } finally {
+        horaeManager.context = oldContext;
+        horaeManager.settings = oldSettings;
+    }
+});
+
+test('总结停用后，日历恢复此前被压缩的原事件', () => {
+    const chat = [message({ date: '2026/2/4', time: '09:00' })];
+    chat[0].horae_meta.events = [{
+        level: '重要',
+        summary: '林夏从账房确认仓库昨夜有人闯入。',
+        _compressedBy: 'S-INACTIVE',
+    }];
+    chat[0].horae_meta.autoSummaries = [{
+        id: 'S-INACTIVE',
+        active: false,
+        coveredIndices: [0],
+    }];
+
+    const calendar = buildStoryCalendar(chat);
+    assert.equal(calendar.days[0].events.length, 1);
+    assert.match(calendar.days[0].events[0].summary, /昨夜有人闯入/);
+});
+
+test('日历优先展示关键事件且最多六条，其余事件仍可展开', () => {
+    const levels = ['一般', '重要', '关键', '重要', '关键', '重要', '关键', '重要', '一般'];
+    const chat = levels.map((level, index) => {
+        const entry = message({
+            date: '2026/2/4',
+            time: `${String(9 + index).padStart(2, '0')}:00`,
+        });
+        entry.horae_meta.events = [{ level, summary: `第 ${index + 1} 条独立剧情事件。` }];
+        return entry;
+    });
+
+    const day = buildStoryCalendar(chat).days[0];
+    assert.equal(day.events.length, 9);
+    assert.equal(day.featuredEvents.length, 6);
+    assert.equal(day.otherEvents.length, 3);
+    assert.deepEqual(day.featuredEvents.map(event => event.priorityRank), [3, 3, 3, 2, 2, 2]);
+    assert.equal(day.otherEvents.some(event => event.priority === 'normal'), true);
+});
+
+test('日历只合并同日真正重复的事件，不吞掉不同事件', () => {
+    const chat = [
+        message({ date: '2026/2/4', time: '09:00', event: '林夏检查了仓库北侧的门锁。' }),
+        message({ date: '2026/2/4', time: '09:30', event: '林夏检查了仓库北侧的门锁。' }),
+        message({ date: '2026/2/4', time: '10:00', event: '林夏检查了仓库南侧的窗户。' }),
+    ];
+
+    const day = buildStoryCalendar(chat).days[0];
+    assert.equal(day.events.length, 2);
+    assert.match(day.events.map(event => event.summary).join(' '), /北侧的门锁/);
+    assert.match(day.events.map(event => event.summary).join(' '), /南侧的窗户/);
+});
+
+test('日历记录地点与关系的实际变化，并保持来源元数据不变', () => {
+    const chat = [
+        message({ date: '2026/2/4', time: '08:00' }),
+        message({ date: '2026/2/4', time: '09:00' }),
+        message({ date: '2026/2/4', time: '10:00' }),
+        message({ date: '2026/2/4', time: '11:00' }),
+    ];
+    chat[0].horae_meta.scene = { location: '旅店' };
+    chat[1].horae_meta.scene = { location: '港口' };
+    chat[1].horae_meta.relationships = [{ from: '林夏', to: '艾伦', type: '合作', note: '暂时互信' }];
+    chat[2].horae_meta.scene = { location: '港口' };
+    chat[2].horae_meta.relationships = [{ from: '林夏', to: '艾伦', type: '合作', note: '暂时互信' }];
+    chat[3].horae_meta.scene = { location: '仓库' };
+    chat[3].horae_meta.relationships = [{ from: '林夏', to: '艾伦', type: '盟友', note: '共同守住秘密' }];
+    const original = structuredClone(chat);
+
+    const day = buildStoryCalendar(chat).days[0];
+
+    assert.deepEqual(day.locationChanges.map(change => [change.from, change.to]), [
+        ['', '旅店'],
+        ['旅店', '港口'],
+        ['港口', '仓库'],
+    ]);
+    assert.deepEqual(day.relationshipChanges.map(change => change.action), ['add', 'update']);
+    assert.equal(day.relationshipChanges[1].type, '盟友');
+    assert.deepEqual(chat, original);
 });
 
 test('叙事日历合并带年份与不带年份的同一日期', () => {

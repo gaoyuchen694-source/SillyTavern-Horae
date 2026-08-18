@@ -947,6 +947,98 @@ function describeItemChange(record, messageIndex, ordinal, fallbackAction = 'upd
     };
 }
 
+/** Calendar-only summary detection. Timeline data remains untouched. */
+export function isCalendarSummaryEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    if (event.isSummary || event._summaryId || event._carryoverSeed) return true;
+    const level = cleanText(event.level).toLowerCase().replace(/\s+/g, '');
+    return /^(?:摘要|总结|總結|summary|要約|요약|конспект)(?:l?\d+)?/iu.test(level)
+        || /^(?:回顾|回顧|recap|振り返り|회고|обзор)$/iu.test(level);
+}
+
+function calendarEventPriority(event) {
+    const level = cleanText(event?.level).toLowerCase();
+    if (/(?:关键|關鍵|critical|핵심|重大|ключ)/iu.test(level)) return 3;
+    if (event?.is_important || /(?:重要|important|중요|важ)/iu.test(level)) return 2;
+    return 1;
+}
+
+function normalizeCalendarEventText(value) {
+    return cleanText(value)
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/[\p{P}\p{S}\s]+/gu, '');
+}
+
+function areSimilarCalendarEvents(left, right) {
+    const a = normalizeCalendarEventText(left);
+    const b = normalizeCalendarEventText(right);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length > b.length ? a : b;
+    return shorter.length >= 12 && longer.includes(shorter) && shorter.length / longer.length >= 0.82;
+}
+
+function addCalendarEvent(day, candidate) {
+    const duplicateIndex = day.events.findIndex(existing =>
+        areSimilarCalendarEvents(existing.summary, candidate.summary)
+    );
+    if (duplicateIndex < 0) {
+        day.events.push(candidate);
+        return;
+    }
+
+    const existing = day.events[duplicateIndex];
+    const candidateWins = candidate.priorityRank > existing.priorityRank
+        || (candidate.priorityRank === existing.priorityRank && candidate.summary.length > existing.summary.length);
+    if (candidateWins) day.events[duplicateIndex] = candidate;
+}
+
+function finalizeCalendarEvents(day, previewLimit = 6) {
+    const chronological = [...day.events].sort((a, b) =>
+        a.messageIndex - b.messageIndex || a.eventIndex - b.eventIndex
+    );
+    const ranked = [...chronological].sort((a, b) =>
+        b.priorityRank - a.priorityRank
+        || a.messageIndex - b.messageIndex
+        || a.eventIndex - b.eventIndex
+    );
+    const important = ranked.filter(event => event.priorityRank >= 2);
+    const normal = ranked.filter(event => event.priorityRank < 2);
+    const featured = important.slice(0, previewLimit);
+    if (featured.length < 3) {
+        featured.push(...normal.slice(0, Math.min(3 - featured.length, previewLimit - featured.length)));
+    }
+    const featuredIds = new Set(featured.map(event => event.id));
+
+    day.events = chronological;
+    day.featuredEvents = featured;
+    day.otherEvents = ranked.filter(event => !featuredIds.has(event.id));
+}
+
+function collectActiveSummaryCoverage(chat) {
+    const ids = new Set();
+    const messageIndices = new Set();
+    const summaries = chat?.[0]?.horae_meta?.autoSummaries;
+    if (!Array.isArray(summaries)) return { ids, messageIndices };
+
+    for (const summary of summaries) {
+        if (!summary || summary.active === false) continue;
+        if (summary.id) ids.add(String(summary.id));
+        if (Array.isArray(summary.coveredIndices) && summary.coveredIndices.length > 0) {
+            for (const index of summary.coveredIndices) {
+                if (Number.isInteger(index) && index >= 0) messageIndices.add(index);
+            }
+        } else if (Array.isArray(summary.range) && summary.range.length >= 2) {
+            const start = Math.max(0, Number(summary.range[0]) || 0);
+            const end = Math.max(start, Number(summary.range[1]) || start);
+            for (let index = start; index <= end; index++) messageIndices.add(index);
+        }
+    }
+    return { ids, messageIndices };
+}
+
 /**
  * Build a narrative calendar from accepted main-story metadata. It never reads
  * the computer clock and never mutates story state. Unknown fantasy dates stay
@@ -959,6 +1051,9 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
     const days = new Map();
     const seenLegacyAgenda = new Set();
     const seenLegacyItems = new Set();
+    const activeSummaryCoverage = collectActiveSummaryCoverage(chat);
+    const relationshipState = new Map();
+    let previousLocation = '';
 
     const findEquivalentDay = (rawDate, parsed) => {
         const candidates = [...days.values()].filter(day => isSameStoryDate(day.date, rawDate));
@@ -1008,9 +1103,13 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
             firstTime: '',
             lastTime: '',
             events: [],
+            featuredEvents: [],
+            otherEvents: [],
             agendaChanges: [],
             agendaDue: [],
             itemChanges: [],
+            locationChanges: [],
+            relationshipChanges: [],
             anomalies: [],
             current: frame.normalizedKey === clock.normalizedKey,
         };
@@ -1043,8 +1142,12 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
         for (let j = 0; j < events.length; j++) {
             const event = events[j];
             const summary = cleanText(event?.summary);
-            if (!summary || event?.isSummary || event?.level === '摘要' || event?._summaryId) continue;
-            day.events.push({
+            const compressedByActive = event?._compressedBy
+                && activeSummaryCoverage.ids.has(String(event._compressedBy));
+            if (!summary || isCalendarSummaryEvent(event) || compressedByActive
+                || activeSummaryCoverage.messageIndices.has(frame.messageIndex)) continue;
+            const priorityRank = calendarEventPriority(event);
+            addCalendarEvent(day, {
                 id: stableMemoryId('E', frame.messageIndex, j, summary),
                 messageIndex: frame.messageIndex,
                 eventIndex: j,
@@ -1052,7 +1155,48 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
                 time: frame.time,
                 level: cleanText(event.level) || '一般',
                 summary,
+                priorityRank,
+                priority: priorityRank >= 3 ? 'critical' : (priorityRank === 2 ? 'important' : 'normal'),
             });
+        }
+
+        const location = cleanText(meta.scene?.location);
+        if (location && location !== previousLocation) {
+            day.locationChanges.push({
+                id: stableMemoryId('LC', frame.messageIndex, 0, `${previousLocation}|${location}`),
+                from: previousLocation,
+                to: location,
+                time: frame.time,
+                messageIndex: frame.messageIndex,
+            });
+            previousLocation = location;
+        }
+
+        // chat[0] stores the rebuilt global relationship snapshot. Historical
+        // changes live on later messages and are the only ones shown here.
+        if (frame.messageIndex > 0) {
+            for (let j = 0; j < (meta.relationships || []).length; j++) {
+                const relationship = meta.relationships[j] || {};
+                const from = cleanText(relationship.from);
+                const to = cleanText(relationship.to);
+                const type = cleanText(relationship.type);
+                const note = cleanText(relationship.note);
+                if (!from || !to || !type || relationship._userEdited) continue;
+                const key = `${from}\u0000${to}`;
+                const previous = relationshipState.get(key);
+                if (previous && previous.type === type && previous.note === note) continue;
+                relationshipState.set(key, { type, note });
+                day.relationshipChanges.push({
+                    id: stableMemoryId('RC', frame.messageIndex, j, `${from}|${to}|${type}|${note}`),
+                    action: previous ? 'update' : 'add',
+                    from,
+                    to,
+                    type,
+                    note,
+                    time: frame.time,
+                    messageIndex: frame.messageIndex,
+                });
+            }
         }
 
         const lifecycleAdds = (meta.agendaLifecycle || [])
@@ -1121,6 +1265,8 @@ export function buildStoryCalendar(chat, end = chat?.length || 0, options = {}) 
             }
         }
     }
+
+    for (const day of days.values()) finalizeCalendarEvents(day);
 
     const parsedCurrent = parseStoryDate(clock.rawDate);
     const currentType = parsedCurrent?.type || 'unknown';

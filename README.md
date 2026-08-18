@@ -1,4 +1,4 @@
-# Horae v1.17.0 - Memory Engine for SillyTavern
+# Horae v1.17.1 - Memory Engine for SillyTavern
 
 **English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
@@ -100,7 +100,7 @@ window.Horae?.getEvents(10)      // → last 10 events
 window.Horae?.getSettings()
 
 // Version string
-window.Horae?.version            // → "1.17.0"
+window.Horae?.version            // → "1.17.1"
 ```
 
 Settings change events are broadcast via SillyTavern's `eventSource`:
@@ -132,16 +132,14 @@ eventSource.on('horae:settingsChanged', (data) => {
 
 ---
 
-## What's New in v1.17.0
+## What's New in v1.17.1
 
-### Memory, Time, and Lifecycles
+### Story Calendar Refinements
 
-- Current-day events now form an authoritative memory ledger independent of normal timeline depth, summary hiding, and vector thresholds.
-- Long-term vector documents include plan, item, NPC identity, and relationship facts from hidden and visible history.
-- The mainline story clock isolates flashbacks and flags unsupported time reversals.
-- Plans and items have replayable lifecycles: completion, cancellation, overdue status, archive, quantity changes, transfer, consumption, expiry, and daily decay. A future plan is not completed or removed merely because the story advances to the next day.
-- The new story calendar and memory-health panel make dates, anomalies, and lifecycle state inspectable.
-- Original Horae `item`, `item-`, `agenda`, and `agenda-` data works directly without migration.
+- The calendar now excludes summaries and carryover recaps while the event timeline continues to display summary cards.
+- Each day initially shows up to six key or important events, with remaining events available through an accessible disclosure control.
+- Similar same-day events are deduplicated, and location and relationship changes now appear alongside plans, items, and time anomalies.
+- Calendar filtering is runtime-only and does not alter chat metadata, AI summary injection, same-day memory, or vector recall.
 
 See [CHANGELOG](CHANGELOG.md) for full version history.
 

@@ -961,6 +961,8 @@ button.horae-calendar-day.has-records {
 .horae-calendar-day-markers .events { background: var(--horae-info); }
 .horae-calendar-day-markers .agenda { background: var(--horae-success); }
 .horae-calendar-day-markers .items { background: var(--horae-accent); }
+.horae-calendar-day-markers .locations { background: #14b8a6; }
+.horae-calendar-day-markers .relationships { background: #ec4899; }
 .horae-calendar-day-markers .overdue,
 .horae-calendar-day-markers .anomaly { background: var(--horae-danger); }
 
@@ -1077,10 +1079,75 @@ button.horae-calendar-record:hover {
     font-variant-numeric: tabular-nums;
 }
 
+.horae-calendar-event-meta {
+    display: inline-flex;
+    min-width: 42px;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px;
+}
+
+.horae-calendar-priority {
+    display: inline-flex;
+    padding: 1px 4px;
+    border: 1px solid currentColor;
+    border-radius: var(--horae-radius-sm);
+    font-size: 8px;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.horae-calendar-priority.critical {
+    color: var(--horae-danger);
+}
+
+.horae-calendar-priority.important {
+    color: var(--horae-warning);
+}
+
+.horae-calendar-record.event.critical {
+    box-shadow: inset 2px 0 0 var(--horae-danger);
+}
+
+.horae-calendar-record.event.important {
+    box-shadow: inset 2px 0 0 var(--horae-warning);
+}
+
+.horae-calendar-record.location .horae-calendar-record-time {
+    color: #14b8a6;
+}
+
 .horae-calendar-action.agenda { color: var(--horae-success); }
 .horae-calendar-action.items { color: var(--horae-accent); }
+.horae-calendar-action.relationships { color: #ec4899; }
 
-#horae_drawer :is(.horae-segment-btn, .horae-calendar-nav-btn, .horae-calendar-today, .horae-calendar-day, .horae-calendar-list-day, .horae-calendar-record):focus-visible {
+.horae-calendar-other-events[hidden] {
+    display: none;
+}
+
+.horae-calendar-disclosure {
+    display: flex;
+    width: 100%;
+    min-height: 34px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 3px;
+    padding: 5px 8px;
+    border: 0;
+    border-radius: var(--horae-radius-sm);
+    background: transparent;
+    color: var(--horae-text-muted);
+    font-size: 10px;
+    cursor: pointer;
+}
+
+.horae-calendar-disclosure:hover {
+    background: var(--horae-bg-hover);
+    color: var(--horae-text);
+}
+
+#horae_drawer :is(.horae-segment-btn, .horae-calendar-nav-btn, .horae-calendar-today, .horae-calendar-day, .horae-calendar-list-day, .horae-calendar-record, .horae-calendar-disclosure):focus-visible {
     outline: 2px solid var(--horae-primary-light);
     outline-offset: 2px;
 }
@@ -1093,7 +1160,8 @@ button.horae-calendar-record:hover {
     .horae-segment-btn,
     .horae-calendar-nav-btn,
     .horae-calendar-today,
-    .horae-calendar-list-day {
+    .horae-calendar-list-day,
+    .horae-calendar-disclosure {
         min-height: 44px;
     }
 
@@ -1126,7 +1194,8 @@ button.horae-calendar-record:hover {
     #horae_drawer .horae-agenda-item,
     #horae_drawer .horae-timeline-item,
     #horae_drawer .horae-segment-btn,
-    #horae_drawer .horae-calendar-record {
+    #horae_drawer .horae-calendar-record,
+    #horae_drawer .horae-calendar-disclosure {
         transition: none !important;
     }
 
